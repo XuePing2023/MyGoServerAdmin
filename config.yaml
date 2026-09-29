@@ -1,0 +1,48 @@
+# ServerAdmin 配置文件
+# 支持 环境变量 覆盖：前缀 SA_，将 key 中的 . 换成 _，
+# 例如：SA_APP_PORT=9090  SA_MONGO_URI=mongodb://localhost:27017  SA_JWT_SECRET=xxx
+# 也可通过 SA_CONFIG 指定其他配置文件路径。
+
+app:
+  name: "ServerAdmin"           # 系统名称（登录页与后台标题）
+  version: "1.0.0"
+  env: "dev"                    # dev | prod（prod 使用 release 模式）
+  port: 8080                    # HTTP 监听端口
+  readTimeout: 30               # 读超时（秒）
+  writeTimeout: 30              # 写超时（秒）
+  uploadDir: "./uploads"        # 文件上传目录
+  maxUploadMB: 20               # 单文件大小上限（MB）
+
+log:
+  level: "info"                 # debug | info | warn | error
+  file: "logs/server.log"       # 日志文件（控制台同步输出）
+  maxSizeMB: 100                # 单文件最大体积，超过轮转
+  maxBackups: 7                 # 保留的历史文件数
+  maxAgeDays: 30                # 保留天数
+
+mongo:
+  uri: "mongodb://localhost:27017"
+  database: "server_admin"
+  timeoutSeconds: 10            # 连接与 Ping 超时
+
+jwt:
+  # 生产环境务必修改，或用环境变量 SA_JWT_SECRET 注入
+  secret: "server-admin-secret-please-change-me"
+  issuer: "server-admin"
+  accessExpireMinutes: 120      # 访问令牌有效期（分钟）
+  refreshExpireHours: 168       # 刷新令牌有效期（小时，7 天）
+
+cors:
+  allowOrigins:                 # 允许的跨域来源，"*" 表示全部
+    - "*"
+
+captcha:
+  enabled: true                 # 登录验证码开关
+  expireSeconds: 300            # 验证码有效期
+
+oplog:
+  enabled: true                 # 操作日志开关（记录非 GET 请求）
+  bodyMaxBytes: 2048            # 请求体最多记录的字节数
+
+seed:
+  enabled: true                 # 首次启动自动初始化索引与演示数据

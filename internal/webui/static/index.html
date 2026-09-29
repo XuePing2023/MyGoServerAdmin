@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ServerAdmin 后台管理系统</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<!-- 登录页 -->
+<div id="login-page" class="login-wrap hidden"></div>
+
+<!-- 应用主框架 -->
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-logo">🛡️</span>
+      <span class="brand-text" id="brand-name">ServerAdmin</span>
+    </div>
+    <nav id="side-menu" class="side-menu"></nav>
+    <div class="sidebar-footer">v<span id="brand-version"></span></div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div id="breadcrumb" class="breadcrumb"></div>
+      <div class="topbar-right">
+        <span class="env-chip" id="env-chip" hidden>DEV</span>
+        <div class="user-chip" id="user-chip">
+          <span class="avatar" id="user-avatar">A</span>
+          <span id="user-nickname"></span>
+          <span class="caret">▾</span>
+          <div class="dropdown hidden" id="user-dropdown">
+            <a data-action="profile">👤 个人中心</a>
+            <a data-action="logout">🚪 退出登录</a>
+          </div>
+        </div>
+      </div>
+    </header>
+    <main id="page" class="page"></main>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root"></div>
+
+<script src="/assets/core.js" defer></script>
+<script src="/assets/pages.js" defer></script>
+<script src="/assets/pages2.js" defer></script>
+</body>
+</html>

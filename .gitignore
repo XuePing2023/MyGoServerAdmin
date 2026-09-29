@@ -1,0 +1,21 @@
+# 构建产物
+bin/
+serveradmin
+serveradmin.exe
+
+# 运行时数据
+logs/
+uploads/
+
+# 本地工具链（如安装在项目旁）
+sdk/
+go.work*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
