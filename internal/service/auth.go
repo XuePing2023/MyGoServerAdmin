@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/crypto/bcrypt"
 
 	"serveradmin/internal/cache"
@@ -13,13 +12,15 @@ import (
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
 	"serveradmin/internal/pkg/jwtx"
+	"serveradmin/internal/repository"
 
 	"github.com/mojocn/base64Captcha"
 )
 
 // AuthService 认证服务：验证码、登录、刷新、登出、个人中心。
 type AuthService struct {
-	db      *mongo.Database
+	user    *repository.UserRepository
+	logs    *repository.LogRepository
 	cfg     *config.Config
 	jwt     *jwtx.Manager
 	token   *TokenService
@@ -30,8 +31,8 @@ type AuthService struct {
 }
 
 // NewAuthService 创建认证服务。
-func NewAuthService(db *mongo.Database, cfg *config.Config, jwtMgr *jwtx.Manager, token *TokenService, menu *MenuService, perm *PermService, helper *cache.Helper) *AuthService {
-	s := &AuthService{db: db, cfg: cfg, jwt: jwtMgr, token: token, menu: menu, perm: perm, cache: helper}
+func NewAuthService(cfg *config.Config, jwtMgr *jwtx.Manager, token *TokenService, menu *MenuService, perm *PermService, user *repository.UserRepository, logs *repository.LogRepository, helper *cache.Helper) *AuthService {
+	s := &AuthService{user: user, logs: logs, cfg: cfg, jwt: jwtMgr, token: token, menu: menu, perm: perm, cache: helper}
 	if cfg.Captcha.Enabled {
 		store := base64Captcha.NewMemoryStore(1024, time.Duration(cfg.Captcha.ExpireSeconds)*time.Second)
 		driver := base64Captcha.NewDriverDigit(80, 240, 4, 0.7, 80)
@@ -90,8 +91,7 @@ func (s *AuthService) Login(ctx context.Context, in *LoginInput, ip, ua string) 
 		}
 	}
 
-	var u model.User
-	err := findOne(ctx, s.db.Collection(model.ColUser), bson.M{"username": in.Username}, &u)
+	u, err := s.user.FindByUsername(ctx, in.Username)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.Password)) != nil {
 		s.recordLogin(ctx, "", in.Username, ip, ua, model.LoginStatusFailed, "用户名或密码错误")
 		return nil, errs.BadRequest("用户名或密码错误")
@@ -109,15 +109,15 @@ func (s *AuthService) Login(ctx context.Context, in *LoginInput, ip, ua string) 
 	}
 
 	now := time.Now()
-	_, _ = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": u.ID},
-		bson.M{"$set": bson.M{"lastLogin": now, "lastIp": ip}})
+	_ = s.user.UpdateSet(ctx, bson.M{"_id": u.ID},
+		bson.M{"lastLogin": now, "lastIp": ip})
 	s.recordLogin(ctx, u.ID, u.Username, ip, ua, model.LoginStatusSuccess, "登录成功")
 
 	return &LoginResult{
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresAt:    exp.Unix(),
-		User:         toUserVO(&u),
+		User:         toUserVO(u),
 	}, nil
 }
 
@@ -130,8 +130,8 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (*LoginR
 	if s.token.Banned(claims.ID) {
 		return nil, errs.Unauthorized("登录状态已失效，请重新登录")
 	}
-	var u model.User
-	if err := findOne(ctx, s.db.Collection(model.ColUser), bson.M{"_id": claims.UserID}, &u); err != nil {
+	u, err := s.user.FindOne(ctx, bson.M{"_id": claims.UserID})
+	if err != nil {
 		return nil, errs.Unauthorized("用户不存在或已被删除")
 	}
 	if u.Status != model.StatusEnabled {
@@ -151,7 +151,7 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (*LoginR
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresAt:    exp.Unix(),
-		User:         toUserVO(&u),
+		User:         toUserVO(u),
 	}, nil
 }
 
@@ -170,8 +170,8 @@ func (s *AuthService) Logout(ctx context.Context, claims *jwtx.Claims, refreshTo
 
 // Profile 个人信息 + 权限 + 可见菜单。
 func (s *AuthService) Profile(ctx context.Context, userID string) (*ProfileResult, error) {
-	var u model.User
-	if err := findOne(ctx, s.db.Collection(model.ColUser), bson.M{"_id": userID}, &u); err != nil {
+	u, err := s.user.FindOne(ctx, bson.M{"_id": userID})
+	if err != nil {
 		return nil, errs.NotFound("用户不存在")
 	}
 	permSet, _, err := s.perm.Get(ctx, userID)
@@ -186,7 +186,7 @@ func (s *AuthService) Profile(ctx context.Context, userID string) (*ProfileResul
 	if err != nil {
 		return nil, err
 	}
-	return &ProfileResult{User: &u, Roles: u.Roles, Perms: perms, Menus: menus}, nil
+	return &ProfileResult{User: u, Roles: u.Roles, Perms: perms, Menus: menus}, nil
 }
 
 // ProfileInput 修改个人资料。
@@ -200,12 +200,12 @@ type ProfileInput struct {
 
 // UpdateProfile 修改个人资料。
 func (s *AuthService) UpdateProfile(ctx context.Context, userID string, in *ProfileInput) error {
-	_, err := s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": userID},
-		bson.M{"$set": bson.M{
+	err := s.user.UpdateSet(ctx, bson.M{"_id": userID},
+		bson.M{
 			"nickname": in.Nickname, "email": in.Email,
 			"phone": in.Phone, "gender": in.Gender, "avatar": in.Avatar,
 			"updatedAt": time.Now(),
-		}})
+		})
 	if err == nil {
 		// 写操作成功后失效该用户缓存（个人资料）
 		s.cache.Invalidate(ctx, cache.UserPrefix(userID))
@@ -221,8 +221,8 @@ type PasswordInput struct {
 
 // ChangePassword 修改自己的密码。
 func (s *AuthService) ChangePassword(ctx context.Context, userID string, in *PasswordInput) error {
-	var u model.User
-	if err := findOne(ctx, s.db.Collection(model.ColUser), bson.M{"_id": userID}, &u); err != nil {
+	u, err := s.user.FindOne(ctx, bson.M{"_id": userID})
+	if err != nil {
 		return errs.NotFound("用户不存在")
 	}
 	if bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.OldPassword)) != nil {
@@ -232,8 +232,8 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID string, in *Pas
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": userID},
-		bson.M{"$set": bson.M{"password": string(hash), "updatedAt": time.Now()}})
+	err = s.user.UpdateSet(ctx, bson.M{"_id": userID},
+		bson.M{"password": string(hash), "updatedAt": time.Now()})
 	if err == nil {
 		s.cache.Invalidate(ctx, cache.UserPrefix(userID))
 	}
@@ -249,7 +249,7 @@ func (s *AuthService) recordLogin(ctx context.Context, userID, username, ip, ua 
 	log.PrepareCreate()
 	bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _ = s.db.Collection(model.ColLoginLog).InsertOne(bg, log)
+	_ = s.logs.InsertLogin(bg, log)
 	_ = ctx
 }
 

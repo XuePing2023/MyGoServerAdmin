@@ -3,17 +3,16 @@ package service
 import (
 	"context"
 	"regexp"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/crypto/bcrypt"
 
 	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
+	"serveradmin/internal/repository"
 )
 
 // 内置超级管理员账号，受保护。
@@ -21,14 +20,17 @@ const BuiltInAdminUsername = "admin"
 
 // UserService 用户管理。
 type UserService struct {
-	db    *mongo.Database
+	user  *repository.UserRepository
+	role  *repository.RoleRepository
+	dept  *repository.DepartmentRepository
 	cfg   *config.Config
 	cache *cache.Helper
 }
 
 // NewUserService 创建用户服务。
-func NewUserService(db *mongo.Database, cfg *config.Config, helper *cache.Helper) *UserService {
-	return &UserService{db: db, cfg: cfg, cache: helper}
+func NewUserService(user *repository.UserRepository, role *repository.RoleRepository,
+	dept *repository.DepartmentRepository, cfg *config.Config, helper *cache.Helper) *UserService {
+	return &UserService{user: user, role: role, dept: dept, cfg: cfg, cache: helper}
 }
 
 var usernameRe = regexp.MustCompile(`^[a-zA-Z0-9_\-@.]{2,32}$`)
@@ -83,15 +85,14 @@ func (s *UserService) List(ctx context.Context, q *UserQuery) ([]*UserItem, int6
 	}
 	if q.DeptID != "" {
 		// 包含子部门下的用户
-		deptSvc := &DepartmentService{db: s.db}
-		ids, err := deptSvc.selfAndDescendantIDs(ctx, q.DeptID)
+		ids, err := s.dept.SelfAndDescendantIDs(ctx, q.DeptID)
 		if err != nil {
 			return nil, 0, err
 		}
 		filter["deptId"] = bson.M{"$in": ids}
 	}
 
-	users, total, err := pageFind[model.User](ctx, s.db.Collection(model.ColUser), filter, page, size, nil)
+	users, total, err := s.user.Page(ctx, filter, page, size, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -101,24 +102,16 @@ func (s *UserService) List(ctx context.Context, q *UserQuery) ([]*UserItem, int6
 // decorate 附加部门名称与角色名称。
 func (s *UserService) decorate(ctx context.Context, users []*model.User) []*UserItem {
 	deptNames := map[string]string{}
-	if cursor, err := s.db.Collection(model.ColDepartment).Find(ctx, bson.M{}); err == nil {
-		var depts []*model.Department
-		if cursor.All(ctx, &depts) == nil {
-			for _, d := range depts {
-				deptNames[d.ID] = d.Name
-			}
+	if depts, err := s.dept.FindAll(ctx, bson.M{}, nil); err == nil {
+		for _, d := range depts {
+			deptNames[d.ID] = d.Name
 		}
-		cursor.Close(ctx)
 	}
 	roleNames := map[string]string{}
-	if cursor, err := s.db.Collection(model.ColRole).Find(ctx, bson.M{}); err == nil {
-		var roles []*model.Role
-		if cursor.All(ctx, &roles) == nil {
-			for _, r := range roles {
-				roleNames[r.Code] = r.Name
-			}
+	if roles, err := s.role.FindAll(ctx, bson.M{}, nil); err == nil {
+		for _, r := range roles {
+			roleNames[r.Code] = r.Name
 		}
-		cursor.Close(ctx)
 	}
 
 	items := make([]*UserItem, 0, len(users))
@@ -140,11 +133,11 @@ func (s *UserService) decorate(ctx context.Context, users []*model.User) []*User
 
 // Get 用户详情。
 func (s *UserService) Get(ctx context.Context, id string) (*model.User, error) {
-	var u model.User
-	if err := findOne(ctx, s.db.Collection(model.ColUser), bson.M{"_id": id}, &u); err != nil {
+	u, err := s.user.FindOne(ctx, bson.M{"_id": id})
+	if err != nil {
 		return nil, errs.NotFound("用户不存在")
 	}
-	return &u, nil
+	return u, nil
 }
 
 // Create 创建用户。
@@ -155,7 +148,7 @@ func (s *UserService) Create(ctx context.Context, in *UserInput, creator string)
 	if !usernameRe.MatchString(in.Username) {
 		return nil, errs.BadRequest("用户名只能包含字母、数字、_-@.，长度 2-32")
 	}
-	n, err := count(ctx, s.db.Collection(model.ColUser), bson.M{"username": in.Username})
+	n, err := s.user.Count(ctx, bson.M{"username": in.Username})
 	if err != nil {
 		return nil, err
 	}
@@ -185,8 +178,7 @@ func (s *UserService) Create(ctx context.Context, in *UserInput, creator string)
 		Remark: in.Remark,
 	}
 	u.PrepareCreate()
-	_, err = s.db.Collection(model.ColUser).InsertOne(ctx, u)
-	if err != nil {
+	if err := s.user.Insert(ctx, u); err != nil {
 		return nil, err
 	}
 	_ = creator
@@ -214,12 +206,12 @@ func (s *UserService) Update(ctx context.Context, id string, in *UserInput) erro
 	if in.Status != 0 && !(u.Username == BuiltInAdminUsername && in.Status == model.StatusDisabled) {
 		update["status"] = in.Status
 	}
-	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": update})
-	if err == nil {
-		// 写操作成功后失效该用户的缓存（个人资料/工作台）
-		s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	if err := s.user.UpdateSet(ctx, bson.M{"_id": id}, update); err != nil {
+		return err
 	}
-	return err
+	// 写操作成功后失效该用户的缓存（个人资料/工作台）
+	s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	return nil
 }
 
 // Delete 批量删除用户。
@@ -232,7 +224,7 @@ func (s *UserService) Delete(ctx context.Context, ids []string, operatorID strin
 			return errs.BadRequest("不能删除当前登录账号")
 		}
 	}
-	n, err := s.db.Collection(model.ColUser).CountDocuments(ctx,
+	n, err := s.user.Count(ctx,
 		bson.M{"_id": bson.M{"$in": ids}, "username": BuiltInAdminUsername})
 	if err != nil {
 		return err
@@ -240,15 +232,15 @@ func (s *UserService) Delete(ctx context.Context, ids []string, operatorID strin
 	if n > 0 {
 		return errs.Forbidden("内置管理员不允许删除")
 	}
-	_, err = s.db.Collection(model.ColUser).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
-	if err == nil {
-		prefixes := make([]string, 0, len(ids))
-		for _, id := range ids {
-			prefixes = append(prefixes, cache.UserPrefix(id))
-		}
-		s.cache.Invalidate(ctx, prefixes...)
+	if _, err := s.user.DeleteByIDs(ctx, ids); err != nil {
+		return err
 	}
-	return err
+	prefixes := make([]string, 0, len(ids))
+	for _, id := range ids {
+		prefixes = append(prefixes, cache.UserPrefix(id))
+	}
+	s.cache.Invalidate(ctx, prefixes...)
+	return nil
 }
 
 // SetStatus 启用/禁用。
@@ -263,12 +255,12 @@ func (s *UserService) SetStatus(ctx context.Context, id string, status int) erro
 	if status != model.StatusEnabled && status != model.StatusDisabled {
 		return errs.BadRequest("状态值无效")
 	}
-	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"status": status, "updatedAt": time.Now()}})
-	if err == nil {
-		s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	if err := s.user.UpdateSet(ctx, bson.M{"_id": id},
+		bson.M{"status": status, "updatedAt": time.Now()}); err != nil {
+		return err
 	}
-	return err
+	s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	return nil
 }
 
 // ResetPassword 管理员重置密码。
@@ -283,19 +275,19 @@ func (s *UserService) ResetPassword(ctx context.Context, id string, password str
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"password": string(hash), "updatedAt": time.Now()}})
-	if err == nil {
-		s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	if err := s.user.UpdateSet(ctx, bson.M{"_id": id},
+		bson.M{"password": string(hash), "updatedAt": time.Now()}); err != nil {
+		return err
 	}
-	return err
+	s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	return nil
 }
 
 func (s *UserService) validateRoles(ctx context.Context, codes []string) error {
 	if len(codes) == 0 {
 		return nil
 	}
-	n, err := count(ctx, s.db.Collection(model.ColRole), bson.M{"code": bson.M{"$in": codes}})
+	n, err := s.role.Count(ctx, bson.M{"code": bson.M{"$in": codes}})
 	if err != nil {
 		return err
 	}
@@ -303,31 +295,4 @@ func (s *UserService) validateRoles(ctx context.Context, codes []string) error {
 		return errs.BadRequest("存在无效的角色")
 	}
 	return nil
-}
-
-// ---------- 通用小工具 ----------
-
-func likeFilter(s string) bson.M {
-	return bson.M{"$regex": regexp.QuoteMeta(strings.TrimSpace(s)), "$options": "i"}
-}
-
-func contains(list []string, v string) bool {
-	for _, item := range list {
-		if item == v {
-			return true
-		}
-	}
-	return false
-}
-
-func unique(list []string) []string {
-	seen := make(map[string]struct{}, len(list))
-	out := make([]string, 0, len(list))
-	for _, v := range list {
-		if _, ok := seen[v]; !ok {
-			seen[v] = struct{}{}
-			out = append(out, v)
-		}
-	}
-	return out
 }

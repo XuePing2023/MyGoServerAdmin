@@ -89,7 +89,7 @@ type SeedConfig struct {
 }
 
 // Load 从 dir（或 SA_CONFIG 指定的文件）加载配置，任何一层缺失都回退到默认值，
-// 保证“零配置”也能启动。
+// 保证“零配置”也能启动。查找顺序：SA_CONFIG 指定文件 > ./config/config.yaml > ./config.yaml。
 func Load() *Config {
 	v := viper.New()
 	setDefaults(v)
@@ -100,6 +100,7 @@ func Load() *Config {
 
 	path := os.Getenv("SA_CONFIG")
 	if path == "" {
+		v.AddConfigPath("./config")
 		v.AddConfigPath(".")
 		v.SetConfigName("config")
 		v.SetConfigType("yaml")

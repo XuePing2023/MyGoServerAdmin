@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"serveradmin/internal/api"
 	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/database"
+	"serveradmin/internal/handler"
 	"serveradmin/internal/pkg/jwtx"
 	"serveradmin/internal/pkg/logger"
 	"serveradmin/internal/service"
@@ -91,7 +91,7 @@ func main() {
 	}
 
 	// HTTP 服务
-	router := api.NewRouter(cfg, reg, jwtMgr, client)
+	router := handler.NewRouter(cfg, reg, jwtMgr, client)
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.App.Port),
 		Handler:      router,

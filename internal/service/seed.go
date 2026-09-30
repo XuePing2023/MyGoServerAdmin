@@ -15,7 +15,7 @@ import (
 // Seed 首次启动时初始化演示数据（users 集合为空才执行）。
 func Seed(ctx context.Context, db *mongo.Database) error {
 	users := db.Collection(model.ColUser)
-	n, err := count(ctx, users, bson.M{})
+	n, err := users.CountDocuments(ctx, bson.M{})
 	if err != nil {
 		return err
 	}

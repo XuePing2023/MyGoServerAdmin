@@ -134,15 +134,17 @@ PUT    /auth/profile/password        修改密码
 ```
 ServerAdmin/
 ├── cmd/server/            # 启动入口（配置、连接、优雅停机）
-├── config.yaml            # 配置文件
+├── config/config.yaml     # 配置文件（加载顺序：SA_CONFIG > ./config > .）
 ├── internal/
-│   ├── api/               # HTTP 接口层（参数绑定/响应）
+│   ├── handler/           # HTTP 接口层（参数绑定/响应）
+│   ├── service/           # 业务层（业务规则、缓存编排、权限）
+│   ├── repository/        # 数据访问层（全部 MongoDB 读写）
+│   ├── cache/             # Redis 缓存（Cache-Aside/singleflight/Key 规范）
 │   ├── config/            # 配置加载（Viper）
 │   ├── database/          # MongoDB 连接与索引
-│   ├── middleware/         # CORS/JWT 认证/权限/操作日志/访问日志/恢复
+│   ├── middleware/         # CORS/JWT 认证/权限/操作日志/响应缓存/访问日志
 │   ├── model/             # 文档模型
 │   ├── pkg/               # errs/response/jwtx/logger 通用包
-│   ├── service/           # 业务层（全部 MongoDB 读写）
 │   ├── webui/             # 内嵌前端（go:embed）
 │   └── static assets      # index.html + app.css + core.js + pages*.js
 ├── logs/                  # 运行日志（自动创建）
@@ -152,9 +154,10 @@ ServerAdmin/
 ## 二次开发：新增一个业务模块
 
 1. `internal/model/xxx.go` 定义文档结构，并在 `internal/database/mongo.go` 注册索引；
-2. `internal/service/xxx.go` 实现业务方法（复用 `pageFind` / `findOne` 等工具）；
-3. `internal/api/xxx.go` 绑定参数、调用 service，用 `response.OK/Page/Handle` 返回；
-4. `internal/api/router.go` 注册路由，并按需在 `middleware.RequirePerm("xxx:yyy")` 上挂权限；
+2. `internal/repository/xxx.go` 定义数据访问方法（复用 `collection[T]` 泛型基类）；
+3. `internal/service/xxx.go` 实现业务方法（缓存读写与失效在此编排）；
+4. `internal/handler/xxx.go` 绑定参数、调用 service，用 `response.OK/Page/Handle` 返回；
+5. `internal/handler/router.go` 注册路由，并按需在 `middleware.RequirePerm("xxx:yyy")` 上挂权限；
 5. 若需要在菜单中可见：登录后到【菜单管理】新增菜单/按钮（权限标识与路由一致）。
 
 前端新增页面：在 `internal/webui/static/assets/pages*.js` 中添加 `window.Pages.xxx = function(container){...}`，菜单的 `component` 填 `xxx` 即可自动路由。

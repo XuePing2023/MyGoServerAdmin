@@ -5,23 +5,22 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"serveradmin/internal/cache"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
+	"serveradmin/internal/repository"
 )
 
 // DictService 字典管理。
 type DictService struct {
-	db    *mongo.Database
+	repo  *repository.DictRepository
 	cache *cache.Helper
 }
 
 // NewDictService 创建字典服务。
-func NewDictService(db *mongo.Database, helper *cache.Helper) *DictService {
-	return &DictService{db: db, cache: helper}
+func NewDictService(repo *repository.DictRepository, helper *cache.Helper) *DictService {
+	return &DictService{repo: repo, cache: helper}
 }
 
 // DictTypeInput 字典类型。
@@ -50,55 +49,52 @@ func (s *DictService) TypeList(ctx context.Context, name string, page, size int)
 		filter["name"] = likeFilter(name)
 	}
 	page, size = normalizePage(page, size)
-	return pageFind[model.DictType](ctx, s.db.Collection(model.ColDictType), filter, page, size,
+	return s.repo.PageType(ctx, filter, page, size,
 		bson.D{{Key: "createdAt", Value: 1}})
 }
 
 // TypeCreate 新建字典类型。
 func (s *DictService) TypeCreate(ctx context.Context, in *DictTypeInput) (*model.DictType, error) {
-	if n, err := count(ctx, s.db.Collection(model.ColDictType), bson.M{"code": in.Code}); err != nil {
+	if n, err := s.repo.CountType(ctx, bson.M{"code": in.Code}); err != nil {
 		return nil, err
 	} else if n > 0 {
 		return nil, errs.BadRequest("字典编码已存在")
 	}
 	t := &model.DictType{Name: in.Name, Code: in.Code, Status: in.Status, Remark: in.Remark}
 	t.PrepareCreate()
-	_, err := s.db.Collection(model.ColDictType).InsertOne(ctx, t)
-	if err == nil {
-		s.invalidateDict(ctx)
+	if err := s.repo.InsertType(ctx, t); err != nil {
+		return nil, err
 	}
-	return t, err
+	s.invalidateDict(ctx)
+	return t, nil
 }
 
 // TypeUpdate 更新字典类型。
 func (s *DictService) TypeUpdate(ctx context.Context, id string, in *DictTypeInput) error {
-	var old model.DictType
-	if err := findOne(ctx, s.db.Collection(model.ColDictType), bson.M{"_id": id}, &old); err != nil {
+	old, err := s.repo.FindType(ctx, bson.M{"_id": id})
+	if err != nil {
 		return errs.NotFound("字典类型不存在")
 	}
 	if in.Code != old.Code {
-		if n, err := count(ctx, s.db.Collection(model.ColDictType), bson.M{"code": in.Code, "_id": bson.M{"$ne": id}}); err != nil {
+		if n, err := s.repo.CountType(ctx, bson.M{"code": in.Code, "_id": bson.M{"$ne": id}}); err != nil {
 			return err
 		} else if n > 0 {
 			return errs.BadRequest("字典编码已存在")
 		}
 	}
-	_, err := s.db.Collection(model.ColDictType).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"name": in.Name, "code": in.Code, "status": in.Status,
-			"remark": in.Remark, "updatedAt": time.Now()}})
-	if err != nil {
+	if err := s.repo.UpdateType(ctx, id,
+		bson.M{"name": in.Name, "code": in.Code, "status": in.Status,
+			"remark": in.Remark, "updatedAt": time.Now()}); err != nil {
 		return err
 	}
 	// 编码变化时同步字典项
 	if in.Code != old.Code {
-		_, err = s.db.Collection(model.ColDictItem).UpdateMany(ctx,
-			bson.M{"typeCode": old.Code},
-			bson.M{"$set": bson.M{"typeCode": in.Code}})
+		if err := s.repo.RenameItemsTypeCode(ctx, old.Code, in.Code); err != nil {
+			return err
+		}
 	}
-	if err == nil {
-		s.invalidateDict(ctx)
-	}
-	return err
+	s.invalidateDict(ctx)
+	return nil
 }
 
 // TypeDelete 删除字典类型及其全部字典项。
@@ -106,28 +102,22 @@ func (s *DictService) TypeDelete(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return errs.BadRequest("请选择要删除的字典类型")
 	}
-	types, err := s.db.Collection(model.ColDictType).Find(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	types, err := s.repo.FindTypesByIDs(ctx, ids)
 	if err != nil {
 		return err
 	}
-	list := make([]*model.DictType, 0)
-	if err := types.All(ctx, &list); err != nil {
-		types.Close(ctx)
-		return err
-	}
-	types.Close(ctx)
-	codes := make([]string, 0, len(list))
-	for _, t := range list {
+	codes := make([]string, 0, len(types))
+	for _, t := range types {
 		codes = append(codes, t.Code)
 	}
-	if _, err := s.db.Collection(model.ColDictItem).DeleteMany(ctx, bson.M{"typeCode": bson.M{"$in": codes}}); err != nil {
+	if _, err := s.repo.DeleteItemsByTypeCodes(ctx, codes); err != nil {
 		return err
 	}
-	_, err = s.db.Collection(model.ColDictType).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
-	if err == nil {
-		s.invalidateDict(ctx)
+	if _, err := s.repo.DeleteTypes(ctx, ids); err != nil {
+		return err
 	}
-	return err
+	s.invalidateDict(ctx)
+	return nil
 }
 
 // ItemList 字典项分页。
@@ -137,13 +127,13 @@ func (s *DictService) ItemList(ctx context.Context, typeCode string, page, size 
 		filter["typeCode"] = typeCode
 	}
 	page, size = normalizePage(page, size)
-	return pageFind[model.DictItem](ctx, s.db.Collection(model.ColDictItem), filter, page, size,
+	return s.repo.PageItem(ctx, filter, page, size,
 		bson.D{{Key: "sort", Value: 1}, {Key: "createdAt", Value: 1}})
 }
 
 // ItemCreate 新建字典项。
 func (s *DictService) ItemCreate(ctx context.Context, in *DictItemInput) (*model.DictItem, error) {
-	if n, err := count(ctx, s.db.Collection(model.ColDictItem),
+	if n, err := s.repo.CountItem(ctx,
 		bson.M{"typeCode": in.TypeCode, "value": in.Value}); err != nil {
 		return nil, err
 	} else if n > 0 {
@@ -154,40 +144,37 @@ func (s *DictService) ItemCreate(ctx context.Context, in *DictItemInput) (*model
 		TagType: in.TagType, Sort: in.Sort, Status: in.Status, Remark: in.Remark,
 	}
 	i.PrepareCreate()
-	_, err := s.db.Collection(model.ColDictItem).InsertOne(ctx, i)
-	if err == nil {
-		s.invalidateDict(ctx)
+	if err := s.repo.InsertItem(ctx, i); err != nil {
+		return nil, err
 	}
-	return i, err
+	s.invalidateDict(ctx)
+	return i, nil
 }
 
 // ItemUpdate 更新字典项。
 func (s *DictService) ItemUpdate(ctx context.Context, id string, in *DictItemInput) error {
-	if n, err := count(ctx, s.db.Collection(model.ColDictItem),
+	if n, err := s.repo.CountItem(ctx,
 		bson.M{"typeCode": in.TypeCode, "value": in.Value, "_id": bson.M{"$ne": id}}); err != nil {
 		return err
 	} else if n > 0 {
 		return errs.BadRequest("该字典下已存在相同键值")
 	}
-	_, err := s.db.Collection(model.ColDictItem).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"label": in.Label, "value": in.Value, "tagType": in.TagType,
-			"sort": in.Sort, "status": in.Status, "remark": in.Remark, "updatedAt": time.Now()}})
-	if err == nil {
-		s.invalidateDict(ctx)
+	if err := s.repo.UpdateItem(ctx, id,
+		bson.M{"label": in.Label, "value": in.Value, "tagType": in.TagType,
+			"sort": in.Sort, "status": in.Status, "remark": in.Remark, "updatedAt": time.Now()}); err != nil {
+		return err
 	}
-	return err
+	s.invalidateDict(ctx)
+	return nil
 }
 
 // ItemDelete 批量删除字典项。
 func (s *DictService) ItemDelete(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return errs.BadRequest("请选择要删除的字典项")
+	if _, err := s.repo.DeleteItems(ctx, ids); err != nil {
+		return err
 	}
-	_, err := s.db.Collection(model.ColDictItem).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
-	if err == nil {
-		s.invalidateDict(ctx)
-	}
-	return err
+	s.invalidateDict(ctx)
+	return nil
 }
 
 // GetByCode 按字典编码取启用的字典项（供下拉框使用）。
@@ -195,18 +182,7 @@ func (s *DictService) ItemDelete(ctx context.Context, ids []string) error {
 func (s *DictService) GetByCode(ctx context.Context, code string) ([]*model.DictItem, error) {
 	return cache.GetJSON(s.cache, ctx, cache.PublicKey("dict", code), s.cache.TTL.Public,
 		func(ctx context.Context) ([]*model.DictItem, error) {
-			opts := options.Find().SetSort(bson.D{{Key: "sort", Value: 1}})
-			cursor, err := s.db.Collection(model.ColDictItem).Find(ctx,
-				bson.M{"typeCode": code, "status": model.StatusEnabled}, opts)
-			if err != nil {
-				return nil, err
-			}
-			defer cursor.Close(ctx)
-			list := make([]*model.DictItem, 0)
-			if err := cursor.All(ctx, &list); err != nil {
-				return nil, err
-			}
-			return list, nil
+			return s.repo.FindEnabledItemsByType(ctx, code)
 		})
 }
 

@@ -11,7 +11,7 @@ FROM alpine:3.20
 RUN adduser -D -u 10001 app
 WORKDIR /app
 COPY --from=builder /out/serveradmin /app/serveradmin
-COPY config.yaml /app/config.yaml
+COPY config/config.yaml /app/config.yaml
 USER app
 EXPOSE 8080
 VOLUME ["/app/uploads", "/app/logs"]

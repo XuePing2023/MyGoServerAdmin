@@ -5,19 +5,19 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"serveradmin/internal/model"
+	"serveradmin/internal/repository"
 )
 
 // LogService 操作日志与登录日志。
 type LogService struct {
-	db *mongo.Database
+	repo *repository.LogRepository
 }
 
 // NewLogService 创建日志服务。
-func NewLogService(db *mongo.Database) *LogService {
-	return &LogService{db: db}
+func NewLogService(repo *repository.LogRepository) *LogService {
+	return &LogService{repo: repo}
 }
 
 // RecordOperation 保存操作日志。
@@ -25,7 +25,7 @@ func (s *LogService) RecordOperation(log *model.OperationLog) {
 	log.PrepareCreate()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _ = s.db.Collection(model.ColOperationLog).InsertOne(ctx, log)
+	_ = s.repo.InsertOperation(ctx, log)
 }
 
 // OpQuery 操作日志查询条件。
@@ -51,17 +51,12 @@ func (s *LogService) OpList(ctx context.Context, q *OpQuery) ([]*model.Operation
 		filter["createdAt"] = rangeFilter
 	}
 	page, size := normalizePage(q.Page, q.Size)
-	return pageFind[model.OperationLog](ctx, s.db.Collection(model.ColOperationLog), filter, page, size, nil)
+	return s.repo.PageOperation(ctx, filter, page, size)
 }
 
 // OpDelete 批量删除；ids 为空时清空全部。
 func (s *LogService) OpDelete(ctx context.Context, ids []string) (int64, error) {
-	var filter bson.M
-	if len(ids) > 0 {
-		filter = bson.M{"_id": bson.M{"$in": ids}}
-	}
-	res, err := s.db.Collection(model.ColOperationLog).DeleteMany(ctx, filter)
-	return res.DeletedCount, err
+	return s.repo.DeleteOperation(ctx, ids)
 }
 
 // LoginQuery 登录日志查询条件。
@@ -87,30 +82,10 @@ func (s *LogService) LoginList(ctx context.Context, q *LoginQuery) ([]*model.Log
 		filter["loginAt"] = rangeFilter
 	}
 	page, size := normalizePage(q.Page, q.Size)
-	return pageFind[model.LoginLog](ctx, s.db.Collection(model.ColLoginLog), filter, page, size, nil)
+	return s.repo.PageLogin(ctx, filter, page, size)
 }
 
 // LoginDelete 批量删除；ids 为空时清空全部。
 func (s *LogService) LoginDelete(ctx context.Context, ids []string) (int64, error) {
-	var filter bson.M
-	if len(ids) > 0 {
-		filter = bson.M{"_id": bson.M{"$in": ids}}
-	}
-	res, err := s.db.Collection(model.ColLoginLog).DeleteMany(ctx, filter)
-	return res.DeletedCount, err
-}
-
-// timeRange 构造时间范围过滤条件（end 为开区间）。
-func timeRange(field string, start, end time.Time) (bson.M, bool) {
-	m := bson.M{}
-	if !start.IsZero() {
-		m["$gte"] = start
-	}
-	if !end.IsZero() {
-		m["$lt"] = end
-	}
-	if len(m) == 0 {
-		return nil, false
-	}
-	return m, true
+	return s.repo.DeleteLogin(ctx, ids)
 }

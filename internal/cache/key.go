@@ -11,16 +11,6 @@ import (
 // KeyPrefix 全局缓存 Key 前缀：serveradmin:v1:{业务}:{资源}:{参数}。
 const KeyPrefix = "serveradmin:v1"
 
-// Policy 缓存策略：决定 Key 中身份段的组成方式。
-type Policy string
-
-const (
-	PolicyNone   Policy = "NONE"   // 完全不缓存（列表/日志/实时数据）
-	PolicyPublic Policy = "PUBLIC" // 所有用户数据相同
-	PolicyUser   Policy = "USER"   // 每个用户不同
-	PolicyRole   Policy = "ROLE"   // 按角色/权限区分
-)
-
 // PublicKey PUBLIC 策略 Key：serveradmin:v1:{biz}:{resource}[:{hash}]。
 // 如 PublicKey("system", "config") -> serveradmin:v1:system:config
 func PublicKey(biz, resource string, paramHash ...string) string {

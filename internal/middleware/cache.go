@@ -1,50 +1,35 @@
-package cache
+package middleware
 
 import (
 	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"serveradmin/internal/cache"
 )
-
-// IdentityFunc 从请求上下文提取登录身份（uid 与角色编码）。
-// 由调用方注入（如基于 middleware.FromContext 实现），避免包间循环依赖。
-type IdentityFunc func(c *gin.Context) (uid string, roles []string, ok bool)
-
-// Rule 单个 API 的显式缓存规则（只缓存 GET，成功响应才写入）。
-type Rule struct {
-	Policy   Policy        // PUBLIC / USER / ROLE
-	Scope    string        // PUBLIC 时的业务段（如 system、menu）
-	Resource string        // 资源段（如 config、menu、profile）
-	TTL      time.Duration // 覆盖策略默认 TTL；0 表示使用策略默认值
-}
-
-// routeKey 策略表的 Key：方法 + 路由模式（c.FullPath()）。
-func routeKey(c *gin.Context) string {
-	return c.Request.Method + " " + c.FullPath()
-}
 
 // ResponseCache HTTP 响应缓存中间件（Cache-Aside）：
 // HIT 直接返回 Redis 中的响应；MISS 放行到 Controller/MongoDB，
 // 成功响应（HTTP 200 且 code=0）回填 Redis。
-// routes 为显式配置表：路由模式 -> 缓存规则，未配置的路由不缓存（NONE）。
-// identity 用于 USER/ROLE 策略组装 Key。
-func ResponseCache(cc Cache, ttl TTLConfig, routes map[string]Rule, identity IdentityFunc) gin.HandlerFunc {
+// routes 为显式配置表：路由模式（方法 + FullPath）-> 缓存规则，
+// 未配置的路由一律不缓存（NONE）。
+// 必须注册在 Auth 之后（USER/ROLE 策略需要登录身份）。
+func ResponseCache(cc cache.Cache, ttl cache.TTLConfig, routes map[string]cache.Rule) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if cc == nil || c.Request.Method != http.MethodGet {
 			c.Next()
 			return
 		}
 		rule, ok := routes[routeKey(c)]
-		if !ok || rule.Policy == PolicyNone {
+		if !ok || rule.Policy == cache.PolicyNone {
 			c.Next()
 			return
 		}
 
-		key, valid := responseKey(c, rule, identity)
+		key, valid := responseKey(c, rule)
 		if !valid {
 			c.Next()
 			return
@@ -59,7 +44,7 @@ func ResponseCache(cc Cache, ttl TTLConfig, routes map[string]Rule, identity Ide
 			return
 		}
 
-		bw := &bodyWriter{ResponseWriter: c.Writer}
+		bw := &cacheBodyWriter{ResponseWriter: c.Writer}
 		c.Writer = bw
 		c.Next()
 		c.Header("Cache-Control", "no-store")
@@ -68,23 +53,16 @@ func ResponseCache(cc Cache, ttl TTLConfig, routes map[string]Rule, identity Ide
 		if bw.Status() == http.StatusOK && bw.buf.Len() > 0 && isSuccessfulBody(bw.buf.Bytes()) {
 			t := rule.TTL
 			if t == 0 {
-				t = ttlFor(ttl, rule.Policy)
+				t = ttl.TTLFor(rule.Policy)
 			}
 			_ = cc.Set(ctx, key, bw.buf.Bytes(), t)
 		}
 	}
 }
 
-// ttlFor 取策略默认 TTL。
-func ttlFor(ttl TTLConfig, p Policy) time.Duration {
-	switch p {
-	case PolicyUser:
-		return ttl.User
-	case PolicyRole:
-		return ttl.Role
-	default:
-		return ttl.Public
-	}
+// routeKey 策略表的 Key：方法 + 路由模式（c.FullPath()）。
+func routeKey(c *gin.Context) string {
+	return c.Request.Method + " " + c.FullPath()
 }
 
 // responseKey 按策略组装 Key：
@@ -94,24 +72,24 @@ func ttlFor(ttl TTLConfig, p Policy) time.Duration {
 //	ROLE   -> serveradmin:v1:role:{role}:{resource}[:{hash}]
 //
 // 路径参数与规范化 QueryString 参与 SHA256，避免不同参数共用 Key。
-// USER 策略取不到登录身份时不缓存。
-func responseKey(c *gin.Context, rule Rule, identity IdentityFunc) (string, bool) {
+// USER/ROLE 策略取不到登录身份时不缓存。
+func responseKey(c *gin.Context, rule cache.Rule) (string, bool) {
 	hash := requestParamHash(c)
 	switch rule.Policy {
-	case PolicyPublic:
-		return PublicKey(rule.Scope, rule.Resource, hash), true
-	case PolicyUser:
-		uid, _, ok := identity(c)
-		if !ok || uid == "" {
+	case cache.PolicyPublic:
+		return cache.PublicKey(rule.Scope, rule.Resource, hash), true
+	case cache.PolicyUser:
+		id := FromContext(c)
+		if id == nil || id.UserID == "" {
 			return "", false
 		}
-		return UserKey(uid, rule.Resource, hash), true
-	case PolicyRole:
-		_, roles, ok := identity(c)
-		if !ok || len(roles) == 0 {
+		return cache.UserKey(id.UserID, rule.Resource, hash), true
+	case cache.PolicyRole:
+		id := FromContext(c)
+		if id == nil || len(id.Roles) == 0 {
 			return "", false
 		}
-		return RoleKey(RoleSegment(roles), rule.Resource, hash), true
+		return cache.RoleKey(cache.RoleSegment(id.Roles), rule.Resource, hash), true
 	default:
 		return "", false
 	}
@@ -126,7 +104,7 @@ func requestParamHash(c *gin.Context) string {
 	for k, vs := range c.Request.URL.Query() {
 		vals[k] = vs
 	}
-	return QueryHash(vals)
+	return cache.QueryHash(vals)
 }
 
 // isSuccessfulBody 仅缓存统一响应格式中 code=0 的成功响应。
@@ -137,18 +115,18 @@ func isSuccessfulBody(body []byte) bool {
 	return json.Unmarshal(body, &probe) == nil && probe.Code == 0
 }
 
-// bodyWriter 捕获下游写入的响应体与状态码。
-type bodyWriter struct {
+// cacheBodyWriter 捕获下游写入的响应体与状态码。
+type cacheBodyWriter struct {
 	gin.ResponseWriter
 	buf bytes.Buffer
 }
 
-func (w *bodyWriter) Write(b []byte) (int, error) {
+func (w *cacheBodyWriter) Write(b []byte) (int, error) {
 	w.buf.Write(b)
 	return w.ResponseWriter.Write(b)
 }
 
-func (w *bodyWriter) WriteString(s string) (int, error) {
+func (w *cacheBodyWriter) WriteString(s string) (int, error) {
 	w.buf.WriteString(s)
 	return w.ResponseWriter.WriteString(s)
 }

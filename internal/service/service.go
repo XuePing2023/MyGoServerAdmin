@@ -1,18 +1,20 @@
-// Package service 业务逻辑层：所有对 MongoDB 的读写都集中在这里。
+// Package service 业务逻辑层：业务规则、缓存编排与权限控制。
+// 数据访问全部委托 internal/repository，本层不直接接触 mongo.Collection。
 package service
 
 import (
-	"context"
+	"regexp"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/jwtx"
+	"serveradmin/internal/repository"
 )
 
 // Registry 聚合所有业务服务，统一构建与传递。
@@ -42,72 +44,63 @@ type Registry struct {
 
 // New 构建所有服务。jwtMgr 由 main 创建后传入；cacheClient 为 nil 表示未启用缓存。
 func New(db *mongo.Database, cfg *config.Config, jwtMgr *jwtx.Manager, cacheClient cache.Cache) *Registry {
+	repos := repository.NewAll(db)
 	helper := cache.NewHelper(cacheClient, cache.TTLConfig{
 		Public: time.Duration(cfg.Cache.PublicTTLSeconds) * time.Second,
 		User:   time.Duration(cfg.Cache.UserTTLSeconds) * time.Second,
 		Role:   time.Duration(cfg.Cache.RoleTTLSeconds) * time.Second,
 	})
 	r := &Registry{
-		Perm:        NewPermService(db),
-		Token:       NewTokenService(db),
+		Perm:        NewPermService(repos.User, repos.Role, repos.Menu),
+		Token:       NewTokenService(repos.Token),
 		Online:      NewOnlineService(time.Duration(cfg.JWT.AccessExpireMinutes) * time.Minute),
 		Cache:       cacheClient,
 		CacheHelper: helper,
 	}
-	r.Menu = NewMenuService(db, helper)
+	r.Menu = NewMenuService(repos.Menu, repos.Role, helper)
 	r.Menu.SetPerm(r.Perm)
-	r.Auth = NewAuthService(db, cfg, jwtMgr, r.Token, r.Menu, r.Perm, helper)
-	r.User = NewUserService(db, cfg, helper)
-	r.Role = NewRoleService(db, helper)
+	r.Auth = NewAuthService(cfg, jwtMgr, r.Token, r.Menu, r.Perm, repos.User, repos.Log, helper)
+	r.User = NewUserService(repos.User, repos.Role, repos.Department, cfg, helper)
+	r.Role = NewRoleService(repos.Role, helper)
 	r.Role.SetPerm(r.Perm)
-	r.Dept = NewDepartmentService(db)
-	r.Dict = NewDictService(db, helper)
-	r.SysConfig = NewSysConfigService(db, helper)
-	r.Log = NewLogService(db)
-	r.File = NewFileService(db, cfg)
-	r.Notice = NewNoticeService(db)
-	r.Job = NewJobService(db)
-	r.Dashboard = NewDashboardService(db)
+	r.Dept = NewDepartmentService(repos.Department)
+	r.Dict = NewDictService(repos.Dict, helper)
+	r.SysConfig = NewSysConfigService(repos.SysConfig, helper)
+	r.Log = NewLogService(repos.Log)
+	r.File = NewFileService(repos.File, cfg)
+	r.Notice = NewNoticeService(repos.Notice)
+	r.Job = NewJobService(repos.Job, repos.Token, repos.Log)
+	r.Dashboard = NewDashboardService(repos.Dashboard)
 	r.Monitor = NewMonitorService()
 	return r
 }
 
-// ---------- 通用小工具（包内共享） ----------
+// ---------- 通用小工具（包内共享，用于组装查询条件） ----------
 
-func findOne(ctx context.Context, c *mongo.Collection, filter bson.M, doc any) error {
-	return c.FindOne(ctx, filter).Decode(doc)
+// likeFilter 大小写不敏感的模糊匹配条件。
+func likeFilter(s string) bson.M {
+	return bson.M{"$regex": regexp.QuoteMeta(strings.TrimSpace(s)), "$options": "i"}
 }
 
-func count(ctx context.Context, c *mongo.Collection, filter bson.M) (int64, error) {
-	return c.CountDocuments(ctx, filter)
+func contains(list []string, v string) bool {
+	for _, item := range list {
+		if item == v {
+			return true
+		}
+	}
+	return false
 }
 
-// pageFind 通用分页查询：按 createdAt 倒序（sort 为 nil 时）。
-func pageFind[T any](ctx context.Context, c *mongo.Collection, filter bson.M, page, size int, sort bson.D) ([]*T, int64, error) {
-	total, err := c.CountDocuments(ctx, filter)
-	if err != nil {
-		return nil, 0, err
+func unique(list []string) []string {
+	seen := make(map[string]struct{}, len(list))
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if _, ok := seen[v]; !ok {
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
 	}
-	if total == 0 {
-		return []*T{}, 0, nil
-	}
-	if sort == nil {
-		sort = bson.D{{Key: "createdAt", Value: -1}}
-	}
-	opts := options.Find().
-		SetSort(sort).
-		SetSkip(int64((page - 1) * size)).
-		SetLimit(int64(size))
-	cursor, err := c.Find(ctx, filter, opts)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer cursor.Close(ctx)
-	list := make([]*T, 0)
-	if err := cursor.All(ctx, &list); err != nil {
-		return nil, 0, err
-	}
-	return list, total, nil
+	return out
 }
 
 // normalizePage 规整分页参数。
@@ -124,18 +117,25 @@ func normalizePage(page, size int) (int, int) {
 	return page, size
 }
 
-// findOpts 便捷构造 FindOptions（按 createdAt 排序 + limit）。
-// v2 中 Find 接受 options.Lister[FindOptions]，*FindOptionsBuilder 实现了该接口。
-func findOpts(sortValue, limit int) *options.FindOptionsBuilder {
-	return options.Find().
-		SetSort(bson.D{{Key: "createdAt", Value: sortValue}}).
-		SetLimit(int64(limit))
-}
-
 // statusFilter 若 status 有效则返回状态过滤条件。
 func statusFilter(status int) bson.M {
 	if status == model.StatusEnabled || status == model.StatusDisabled {
 		return bson.M{"status": status}
 	}
 	return bson.M{}
+}
+
+// timeRange 构造时间范围过滤条件（end 为开区间）。
+func timeRange(field string, start, end time.Time) (bson.M, bool) {
+	m := bson.M{}
+	if !start.IsZero() {
+		m["$gte"] = start
+	}
+	if !end.IsZero() {
+		m["$lt"] = end
+	}
+	if len(m) == 0 {
+		return nil, false
+	}
+	return m, true
 }

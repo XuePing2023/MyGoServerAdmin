@@ -9,15 +9,21 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
 	"serveradmin/internal/pkg/logger"
+	"serveradmin/internal/repository"
 )
 
-// HandlerFunc 定时任务处理器：ctx / 数据库 / JSON 参数。
-type HandlerFunc func(ctx context.Context, db *mongo.Database, params string) (string, error)
+// HandlerDeps 定时任务处理器的数据访问依赖。
+type HandlerDeps struct {
+	Token *repository.TokenRepository
+	Log   *repository.LogRepository
+}
+
+// HandlerFunc 定时任务处理器：ctx / 数据访问依赖 / JSON 参数。
+type HandlerFunc func(ctx context.Context, deps *HandlerDeps, params string) (string, error)
 
 // handlerRegistry 内置任务处理器注册表。
 var handlerRegistry = map[string]HandlerFunc{
@@ -37,38 +43,35 @@ func HandlerCatalog() map[string]string {
 	}
 }
 
-func handleCleanupExpiredTokens(ctx context.Context, db *mongo.Database, params string) (string, error) {
-	res, err := db.Collection(model.ColTokenBlacklist).DeleteMany(ctx,
-		bson.M{"expireAt": bson.M{"$lte": time.Now()}})
+func handleCleanupExpiredTokens(ctx context.Context, deps *HandlerDeps, params string) (string, error) {
+	n, err := deps.Token.DeleteExpired(ctx, time.Now())
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已清理过期令牌 %d 条", res.DeletedCount), nil
+	return fmt.Sprintf("已清理过期令牌 %d 条", n), nil
 }
 
-func handleCleanupOperationLogs(ctx context.Context, db *mongo.Database, params string) (string, error) {
+func handleCleanupOperationLogs(ctx context.Context, deps *HandlerDeps, params string) (string, error) {
 	days := parseDaysParam(params, 90)
 	cut := time.Now().AddDate(0, 0, -days)
-	res, err := db.Collection(model.ColOperationLog).DeleteMany(ctx,
-		bson.M{"createdAt": bson.M{"$lt": cut}})
+	n, err := deps.Log.DeleteOperationBefore(ctx, cut)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已清理 %d 天前的操作日志 %d 条", days, res.DeletedCount), nil
+	return fmt.Sprintf("已清理 %d 天前的操作日志 %d 条", days, n), nil
 }
 
-func handleCleanupLoginLogs(ctx context.Context, db *mongo.Database, params string) (string, error) {
+func handleCleanupLoginLogs(ctx context.Context, deps *HandlerDeps, params string) (string, error) {
 	days := parseDaysParam(params, 180)
 	cut := time.Now().AddDate(0, 0, -days)
-	res, err := db.Collection(model.ColLoginLog).DeleteMany(ctx,
-		bson.M{"loginAt": bson.M{"$lt": cut}})
+	n, err := deps.Log.DeleteLoginBefore(ctx, cut)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已清理 %d 天前的登录日志 %d 条", days, res.DeletedCount), nil
+	return fmt.Sprintf("已清理 %d 天前的登录日志 %d 条", days, n), nil
 }
 
-func handleDemoHeartbeat(ctx context.Context, db *mongo.Database, params string) (string, error) {
+func handleDemoHeartbeat(ctx context.Context, deps *HandlerDeps, params string) (string, error) {
 	msg := fmt.Sprintf("heartbeat ok at %s", time.Now().Format(time.DateTime))
 	logger.L.Info("定时任务心跳: ", msg)
 	return msg, nil
@@ -89,16 +92,18 @@ func parseDaysParam(params string, def int) int {
 
 // JobService 定时任务管理（基于 robfig/cron）。
 type JobService struct {
-	db      *mongo.Database
+	jobs    *repository.JobRepository
+	deps    *HandlerDeps
 	cron    *cron.Cron
 	mu      sync.Mutex
 	entries map[string]cron.EntryID // jobID -> cron entry
 }
 
 // NewJobService 创建定时任务服务。
-func NewJobService(db *mongo.Database) *JobService {
+func NewJobService(jobs *repository.JobRepository, token *repository.TokenRepository, logs *repository.LogRepository) *JobService {
 	return &JobService{
-		db:      db,
+		jobs:    jobs,
+		deps:    &HandlerDeps{Token: token, Log: logs},
 		cron:    cron.New(),
 		entries: make(map[string]cron.EntryID),
 	}
@@ -106,16 +111,10 @@ func NewJobService(db *mongo.Database) *JobService {
 
 // Start 从数据库加载启用的任务并启动调度器。
 func (s *JobService) Start(ctx context.Context) error {
-	cursor, err := s.db.Collection(model.ColJob).Find(ctx, bson.M{"status": model.StatusEnabled})
+	jobs, err := s.jobs.FindEnabled(ctx)
 	if err != nil {
 		return err
 	}
-	var jobs []*model.Job
-	if err := cursor.All(ctx, &jobs); err != nil {
-		cursor.Close(ctx)
-		return err
-	}
-	cursor.Close(ctx)
 
 	for _, j := range jobs {
 		if err := s.schedule(j); err != nil {
@@ -164,7 +163,7 @@ func (s *JobService) List(ctx context.Context, name string, status, page, size i
 		filter["name"] = likeFilter(name)
 	}
 	page, size = normalizePage(page, size)
-	return pageFind[model.Job](ctx, s.db.Collection(model.ColJob), filter, page, size, nil)
+	return s.jobs.PageJob(ctx, filter, page, size)
 }
 
 // Create 创建任务。
@@ -172,7 +171,7 @@ func (s *JobService) Create(ctx context.Context, in *JobInput) (*model.Job, erro
 	if err := in.validate(); err != nil {
 		return nil, err
 	}
-	if n, err := count(ctx, s.db.Collection(model.ColJob), bson.M{"name": in.Name}); err != nil {
+	if n, err := s.jobs.CountJob(ctx, bson.M{"name": in.Name}); err != nil {
 		return nil, err
 	} else if n > 0 {
 		return nil, errs.BadRequest("任务名称已存在")
@@ -182,7 +181,7 @@ func (s *JobService) Create(ctx context.Context, in *JobInput) (*model.Job, erro
 		Params: in.Params, Status: in.Status, Remark: in.Remark,
 	}
 	j.PrepareCreate()
-	if _, err := s.db.Collection(model.ColJob).InsertOne(ctx, j); err != nil {
+	if err := s.jobs.InsertJob(ctx, j); err != nil {
 		return nil, err
 	}
 	if j.Status == model.StatusEnabled {
@@ -198,7 +197,7 @@ func (s *JobService) Update(ctx context.Context, id string, in *JobInput) error 
 	if _, err := s.get(ctx, id); err != nil {
 		return err
 	}
-	if n, err := count(ctx, s.db.Collection(model.ColJob), bson.M{"name": in.Name, "_id": bson.M{"$ne": id}}); err != nil {
+	if n, err := s.jobs.CountJob(ctx, bson.M{"name": in.Name, "_id": bson.M{"$ne": id}}); err != nil {
 		return err
 	} else if n > 0 {
 		return errs.BadRequest("任务名称已存在")
@@ -206,10 +205,9 @@ func (s *JobService) Update(ctx context.Context, id string, in *JobInput) error 
 	if err := in.validate(); err != nil {
 		return err
 	}
-	_, err := s.db.Collection(model.ColJob).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"name": in.Name, "spec": in.Spec, "handler": in.Handler,
-			"params": in.Params, "status": in.Status, "remark": in.Remark, "updatedAt": time.Now()}})
-	if err != nil {
+	if err := s.jobs.UpdateJob(ctx, id,
+		bson.M{"name": in.Name, "spec": in.Spec, "handler": in.Handler,
+			"params": in.Params, "status": in.Status, "remark": in.Remark, "updatedAt": time.Now()}); err != nil {
 		return err
 	}
 	s.unschedule(id)
@@ -231,7 +229,7 @@ func (s *JobService) Delete(ctx context.Context, ids []string) error {
 	for _, id := range ids {
 		s.unschedule(id)
 	}
-	_, err := s.db.Collection(model.ColJob).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	_, err := s.jobs.DeleteJobs(ctx, ids)
 	return err
 }
 
@@ -243,9 +241,8 @@ func (s *JobService) SetStatus(ctx context.Context, id string, status int) error
 	if status != model.StatusEnabled && status != model.StatusDisabled {
 		return errs.BadRequest("状态值无效")
 	}
-	_, err := s.db.Collection(model.ColJob).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"status": status, "updatedAt": time.Now()}})
-	if err != nil {
+	if err := s.jobs.UpdateJob(ctx, id,
+		bson.M{"status": status, "updatedAt": time.Now()}); err != nil {
 		return err
 	}
 	s.unschedule(id)
@@ -279,7 +276,7 @@ func (s *JobService) JobLogs(ctx context.Context, jobName string, page, size int
 		filter["jobName"] = jobName
 	}
 	page, size = normalizePage(page, size)
-	return pageFind[model.JobLog](ctx, s.db.Collection(model.ColJobLog), filter, page, size, nil)
+	return s.jobs.PageJobLog(ctx, filter, page, size)
 }
 
 // schedule 注册任务到调度器并更新下次执行时间。
@@ -305,7 +302,7 @@ func (s *JobService) schedule(j *model.Job) error {
 		next := entry.Next
 		bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = s.db.Collection(model.ColJob).UpdateOne(bg, bson.M{"_id": j.ID},
+		_ = s.jobs.UpdateJobRaw(bg, bson.M{"_id": j.ID},
 			bson.M{"$set": bson.M{"nextRun": next}})
 	}
 	return nil
@@ -340,7 +337,7 @@ func (s *JobService) execute(j *model.Job, manual bool) {
 	}()
 	handler := handlerRegistry[j.Handler]
 	start := time.Now()
-	output, err := handler(context.Background(), s.db, j.Params)
+	output, err := handler(context.Background(), s.deps, j.Params)
 
 	log := &model.JobLog{
 		JobName: j.Name, Handler: j.Handler, RunAt: start,
@@ -356,13 +353,13 @@ func (s *JobService) execute(j *model.Job, manual bool) {
 
 	bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _ = s.db.Collection(model.ColJobLog).InsertOne(bg, log)
+	_ = s.jobs.InsertJobLog(bg, log)
 
 	inc := bson.M{"runCount": 1, "lastRun": start}
 	if err != nil {
 		inc["failCount"] = 1
 	}
-	_, _ = s.db.Collection(model.ColJob).UpdateOne(bg, bson.M{"_id": j.ID},
+	_ = s.jobs.UpdateJobRaw(bg, bson.M{"_id": j.ID},
 		bson.M{"$inc": inc, "$set": bson.M{"updatedAt": time.Now()}})
 
 	if err != nil {
@@ -373,9 +370,9 @@ func (s *JobService) execute(j *model.Job, manual bool) {
 }
 
 func (s *JobService) get(ctx context.Context, id string) (*model.Job, error) {
-	var j model.Job
-	if err := findOne(ctx, s.db.Collection(model.ColJob), bson.M{"_id": id}, &j); err != nil {
+	j, err := s.jobs.FindJob(ctx, bson.M{"_id": id})
+	if err != nil {
 		return nil, errs.NotFound("任务不存在")
 	}
-	return &j, nil
+	return j, nil
 }

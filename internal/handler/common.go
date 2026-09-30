@@ -1,5 +1,5 @@
 // Package api HTTP 接口层：参数绑定与响应，业务逻辑在 service。
-package api
+package handler
 
 import (
 	"net/http"

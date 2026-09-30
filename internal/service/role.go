@@ -6,26 +6,25 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"serveradmin/internal/cache"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
+	"serveradmin/internal/repository"
 )
 
-var roleCodeRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{1,31}$`)
+var roleCodeRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{1,32}$`)
 
 // RoleService 角色管理。
 type RoleService struct {
-	db    *mongo.Database
+	repo  *repository.RoleRepository
 	perm  *PermService
 	cache *cache.Helper
 }
 
 // NewRoleService 创建角色服务。
-func NewRoleService(db *mongo.Database, helper *cache.Helper) *RoleService {
-	return &RoleService{db: db, cache: helper}
+func NewRoleService(repo *repository.RoleRepository, helper *cache.Helper) *RoleService {
+	return &RoleService{repo: repo, cache: helper}
 }
 
 // SetPerm 注入权限缓存。
@@ -56,30 +55,25 @@ func (s *RoleService) List(ctx context.Context, q *RoleQuery) ([]*model.Role, in
 		filter["name"] = likeFilter(q.Name)
 	}
 	if q.All {
-		opts := options.Find().SetSort(bson.D{{Key: "sort", Value: 1}, {Key: "createdAt", Value: 1}})
-		cursor, err := s.db.Collection(model.ColRole).Find(ctx, filter, opts)
+		list, err := s.repo.FindAll(ctx, filter,
+			bson.D{{Key: "sort", Value: 1}, {Key: "createdAt", Value: 1}})
 		if err != nil {
-			return nil, 0, err
-		}
-		defer cursor.Close(ctx)
-		list := make([]*model.Role, 0)
-		if err := cursor.All(ctx, &list); err != nil {
 			return nil, 0, err
 		}
 		return list, int64(len(list)), nil
 	}
 	page, size := normalizePage(q.Page, q.Size)
-	return pageFind[model.Role](ctx, s.db.Collection(model.ColRole), filter, page, size,
+	return s.repo.Page(ctx, filter, page, size,
 		bson.D{{Key: "sort", Value: 1}, {Key: "createdAt", Value: 1}})
 }
 
 // Get 角色详情。
 func (s *RoleService) Get(ctx context.Context, id string) (*model.Role, error) {
-	var r model.Role
-	if err := findOne(ctx, s.db.Collection(model.ColRole), bson.M{"_id": id}, &r); err != nil {
+	r, err := s.repo.FindOne(ctx, bson.M{"_id": id})
+	if err != nil {
 		return nil, errs.NotFound("角色不存在")
 	}
-	return &r, nil
+	return r, nil
 }
 
 // Create 创建角色。
@@ -87,7 +81,7 @@ func (s *RoleService) Create(ctx context.Context, in *RoleInput) (*model.Role, e
 	if !roleCodeRe.MatchString(in.Code) {
 		return nil, errs.BadRequest("角色编码需以字母开头，仅含字母数字_-，长度 2-32")
 	}
-	n, err := count(ctx, s.db.Collection(model.ColRole), bson.M{"code": in.Code})
+	n, err := s.repo.Count(ctx, bson.M{"code": in.Code})
 	if err != nil {
 		return nil, err
 	}
@@ -99,8 +93,11 @@ func (s *RoleService) Create(ctx context.Context, in *RoleInput) (*model.Role, e
 		Status: in.Status, Remark: in.Remark, Menus: []string{},
 	}
 	r.PrepareCreate()
-	_, err = s.db.Collection(model.ColRole).InsertOne(ctx, r)
-	return r, err
+	if err := s.repo.Insert(ctx, r); err != nil {
+		return nil, err
+	}
+	s.invalidate(ctx)
+	return r, nil
 }
 
 // Update 更新角色（内置角色仅允许改名称/备注/排序）。
@@ -118,7 +115,7 @@ func (s *RoleService) Update(ctx context.Context, id string, in *RoleInput) erro
 			if !roleCodeRe.MatchString(in.Code) {
 				return errs.BadRequest("角色编码格式无效")
 			}
-			n, err := count(ctx, s.db.Collection(model.ColRole), bson.M{"code": in.Code, "_id": bson.M{"$ne": id}})
+			n, err := s.repo.Count(ctx, bson.M{"code": in.Code, "_id": bson.M{"$ne": id}})
 			if err != nil {
 				return err
 			}
@@ -135,8 +132,7 @@ func (s *RoleService) Update(ctx context.Context, id string, in *RoleInput) erro
 		update["code"] = r.Code
 		update["status"] = r.Status
 	}
-	_, err = s.db.Collection(model.ColRole).UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": update})
-	if err != nil {
+	if err := s.repo.UpdateSet(ctx, bson.M{"_id": id}, update); err != nil {
 		return err
 	}
 	s.invalidate(ctx)
@@ -148,16 +144,10 @@ func (s *RoleService) Delete(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return errs.BadRequest("请选择要删除的角色")
 	}
-	roles, err := s.db.Collection(model.ColRole).Find(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	list, err := s.repo.FindByIDs(ctx, ids)
 	if err != nil {
 		return err
 	}
-	list := make([]*model.Role, 0)
-	if err := roles.All(ctx, &list); err != nil {
-		roles.Close(ctx)
-		return err
-	}
-	roles.Close(ctx)
 
 	codes := make([]string, 0)
 	for _, r := range list {
@@ -166,15 +156,14 @@ func (s *RoleService) Delete(ctx context.Context, ids []string) error {
 		}
 		codes = append(codes, r.Code)
 	}
-	n, err := count(ctx, s.db.Collection(model.ColUser), bson.M{"roles": bson.M{"$in": codes}})
+	n, err := s.repo.CountUsersByRoleCodes(ctx, codes)
 	if err != nil {
 		return err
 	}
 	if n > 0 {
 		return errs.BadRequest("有 %d 个用户正在使用待删除的角色，请先调整", n)
 	}
-	_, err = s.db.Collection(model.ColRole).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
-	if err != nil {
+	if _, err := s.repo.DeleteByIDs(ctx, ids); err != nil {
 		return err
 	}
 	s.invalidate(ctx)
@@ -189,9 +178,8 @@ func (s *RoleService) AssignMenus(ctx context.Context, id string, menuIDs []stri
 	if menuIDs == nil {
 		menuIDs = []string{}
 	}
-	_, err := s.db.Collection(model.ColRole).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"menus": menuIDs, "updatedAt": time.Now()}})
-	if err != nil {
+	if err := s.repo.UpdateSet(ctx, bson.M{"_id": id},
+		bson.M{"menus": menuIDs, "updatedAt": time.Now()}); err != nil {
 		return err
 	}
 	s.invalidate(ctx)

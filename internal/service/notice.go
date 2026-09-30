@@ -5,21 +5,20 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
+	"serveradmin/internal/repository"
 )
 
 // NoticeService 通知公告管理。
 type NoticeService struct {
-	db *mongo.Database
+	repo *repository.NoticeRepository
 }
 
 // NewNoticeService 创建通知公告服务。
-func NewNoticeService(db *mongo.Database) *NoticeService {
-	return &NoticeService{db: db}
+func NewNoticeService(repo *repository.NoticeRepository) *NoticeService {
+	return &NoticeService{repo: repo}
 }
 
 // NoticeInput 创建/更新。
@@ -43,16 +42,16 @@ func (s *NoticeService) List(ctx context.Context, title string, ntype, status, p
 		filter["status"] = status
 	}
 	page, size = normalizePage(page, size)
-	return pageFind[model.Notice](ctx, s.db.Collection(model.ColNotice), filter, page, size, nil)
+	return s.repo.Page(ctx, filter, page, size, nil)
 }
 
 // Get 详情。
 func (s *NoticeService) Get(ctx context.Context, id string) (*model.Notice, error) {
-	var n model.Notice
-	if err := findOne(ctx, s.db.Collection(model.ColNotice), bson.M{"_id": id}, &n); err != nil {
+	n, err := s.repo.FindOne(ctx, bson.M{"_id": id})
+	if err != nil {
 		return nil, errs.NotFound("通知不存在")
 	}
-	return &n, nil
+	return n, nil
 }
 
 // Create 创建。
@@ -62,8 +61,10 @@ func (s *NoticeService) Create(ctx context.Context, in *NoticeInput, publisher s
 		Status: in.Status, Publisher: publisher,
 	}
 	n.PrepareCreate()
-	_, err := s.db.Collection(model.ColNotice).InsertOne(ctx, n)
-	return n, err
+	if err := s.repo.Insert(ctx, n); err != nil {
+		return nil, err
+	}
+	return n, nil
 }
 
 // Update 更新。
@@ -71,10 +72,9 @@ func (s *NoticeService) Update(ctx context.Context, id string, in *NoticeInput) 
 	if _, err := s.Get(ctx, id); err != nil {
 		return err
 	}
-	_, err := s.db.Collection(model.ColNotice).UpdateOne(ctx, bson.M{"_id": id},
-		bson.M{"$set": bson.M{"title": in.Title, "type": in.Type, "content": in.Content,
-			"status": in.Status, "updatedAt": time.Now()}})
-	return err
+	return s.repo.UpdateSet(ctx, bson.M{"_id": id},
+		bson.M{"title": in.Title, "type": in.Type, "content": in.Content,
+			"status": in.Status, "updatedAt": time.Now()})
 }
 
 // Delete 批量删除。
@@ -82,23 +82,11 @@ func (s *NoticeService) Delete(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return errs.BadRequest("请选择要删除的公告")
 	}
-	_, err := s.db.Collection(model.ColNotice).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	_, err := s.repo.DeleteByIDs(ctx, ids)
 	return err
 }
 
 // Recent 最近发布的公告。
 func (s *NoticeService) Recent(ctx context.Context, limit int) ([]*model.Notice, error) {
-	opts := options.Find().
-		SetSort(bson.D{{Key: "createdAt", Value: -1}}).
-		SetLimit(int64(limit))
-	cursor, err := s.db.Collection(model.ColNotice).Find(ctx, bson.M{"status": 1}, opts)
-	if err != nil {
-		return nil, err
-	}
-	defer cursor.Close(ctx)
-	list := make([]*model.Notice, 0)
-	if err := cursor.All(ctx, &list); err != nil {
-		return nil, err
-	}
-	return list, nil
+	return s.repo.FindRecent(ctx, limit)
 }
