@@ -4,7 +4,7 @@ package model
 import (
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // 集合名称。
@@ -48,7 +48,7 @@ type BaseModel struct {
 }
 
 // NewID 生成新的 ObjectID hex 字符串。
-func NewID() string { return primitive.NewObjectID().Hex() }
+func NewID() string { return bson.NewObjectID().Hex() }
 
 // PrepareCreate 新建时填充 ID 与时间。
 func (b *BaseModel) PrepareCreate() {

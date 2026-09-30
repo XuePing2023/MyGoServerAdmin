@@ -10,7 +10,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"serveradmin/internal/pkg/errs"
 	"serveradmin/internal/pkg/logger"

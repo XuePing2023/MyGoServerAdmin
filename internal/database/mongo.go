@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
@@ -25,7 +25,8 @@ func Connect(cfg *config.Config) (*mongo.Client, *mongo.Database, error) {
 		SetConnectTimeout(timeout).
 		SetServerSelectionTimeout(timeout)
 
-	client, err := mongo.Connect(ctx, clientOpts)
+	// v2 的 Connect 不再接受 context，连接超时由 SetConnectTimeout 控制。
+	client, err := mongo.Connect(clientOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("连接 MongoDB 失败: %w", err)
 	}

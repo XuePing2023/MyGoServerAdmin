@@ -5,9 +5,9 @@ import (
 	"context"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
@@ -111,7 +111,8 @@ func normalizePage(page, size int) (int, int) {
 }
 
 // findOpts 便捷构造 FindOptions（按 createdAt 排序 + limit）。
-func findOpts(sortValue, limit int) *options.FindOptions {
+// v2 中 Find 接受 options.Lister[FindOptions]，*FindOptionsBuilder 实现了该接口。
+func findOpts(sortValue, limit int) *options.FindOptionsBuilder {
 	return options.Find().
 		SetSort(bson.D{{Key: "createdAt", Value: sortValue}}).
 		SetLimit(int64(limit))

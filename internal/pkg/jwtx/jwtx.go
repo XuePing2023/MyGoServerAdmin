@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // 令牌类型。
@@ -67,7 +67,7 @@ func (m *Manager) Generate(u *TokenUser) (string, string, time.Time, error) {
 		UserID: u.ID, Username: u.Username, Nickname: u.Nickname,
 		Roles: u.Roles, Type: TypeAccess,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        primitive.NewObjectID().Hex(),
+			ID:        bson.NewObjectID().Hex(),
 			Issuer:    m.issuer,
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(accessExp),
@@ -81,7 +81,7 @@ func (m *Manager) Generate(u *TokenUser) (string, string, time.Time, error) {
 		UserID: u.ID, Username: u.Username, Nickname: u.Nickname,
 		Roles: u.Roles, Type: TypeRefresh,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        primitive.NewObjectID().Hex(),
+			ID:        bson.NewObjectID().Hex(),
 			Issuer:    m.issuer,
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(refreshExp),
