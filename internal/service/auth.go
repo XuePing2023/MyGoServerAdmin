@@ -8,6 +8,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/crypto/bcrypt"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
@@ -24,12 +25,13 @@ type AuthService struct {
 	token   *TokenService
 	menu    *MenuService
 	perm    *PermService
+	cache   *cache.Helper
 	captcha *base64Captcha.Captcha // 为 nil 表示未启用验证码
 }
 
 // NewAuthService 创建认证服务。
-func NewAuthService(db *mongo.Database, cfg *config.Config, jwtMgr *jwtx.Manager, token *TokenService, menu *MenuService, perm *PermService) *AuthService {
-	s := &AuthService{db: db, cfg: cfg, jwt: jwtMgr, token: token, menu: menu, perm: perm}
+func NewAuthService(db *mongo.Database, cfg *config.Config, jwtMgr *jwtx.Manager, token *TokenService, menu *MenuService, perm *PermService, helper *cache.Helper) *AuthService {
+	s := &AuthService{db: db, cfg: cfg, jwt: jwtMgr, token: token, menu: menu, perm: perm, cache: helper}
 	if cfg.Captcha.Enabled {
 		store := base64Captcha.NewMemoryStore(1024, time.Duration(cfg.Captcha.ExpireSeconds)*time.Second)
 		driver := base64Captcha.NewDriverDigit(80, 240, 4, 0.7, 80)
@@ -204,6 +206,10 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID string, in *Prof
 			"phone": in.Phone, "gender": in.Gender, "avatar": in.Avatar,
 			"updatedAt": time.Now(),
 		}})
+	if err == nil {
+		// 写操作成功后失效该用户缓存（个人资料）
+		s.cache.Invalidate(ctx, cache.UserPrefix(userID))
+	}
 	return err
 }
 
@@ -228,6 +234,9 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID string, in *Pas
 	}
 	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": userID},
 		bson.M{"$set": bson.M{"password": string(hash), "updatedAt": time.Now()}})
+	if err == nil {
+		s.cache.Invalidate(ctx, cache.UserPrefix(userID))
+	}
 	return err
 }
 

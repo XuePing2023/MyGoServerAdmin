@@ -14,6 +14,8 @@ type Config struct {
 	App     AppConfig     `mapstructure:"app"`
 	Log     LogConfig     `mapstructure:"log"`
 	Mongo   MongoConfig   `mapstructure:"mongo"`
+	Redis   RedisConfig   `mapstructure:"redis"`
+	Cache   CacheConfig   `mapstructure:"cache"`
 	JWT     JWTConfig     `mapstructure:"jwt"`
 	CORS    CORSConfig    `mapstructure:"cors"`
 	Captcha CaptchaConfig `mapstructure:"captcha"`
@@ -44,6 +46,21 @@ type MongoConfig struct {
 	URI            string `mapstructure:"uri"`
 	Database       string `mapstructure:"database"`
 	TimeoutSeconds int    `mapstructure:"timeoutSeconds"`
+}
+
+// RedisConfig Redis 连接配置，enabled=false 时不启用缓存。
+type RedisConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
+}
+
+// CacheConfig 缓存策略 TTL（秒），按策略区分，避免全部一样。
+type CacheConfig struct {
+	PublicTTLSeconds int `mapstructure:"publicTTLSeconds"` // PUBLIC：全用户共享（系统参数/字典）
+	UserTTLSeconds   int `mapstructure:"userTTLSeconds"`   // USER：按用户区分（个人资料/工作台）
+	RoleTTLSeconds   int `mapstructure:"roleTTLSeconds"`   // ROLE：按角色区分（菜单/权限）
 }
 
 type JWTConfig struct {
@@ -127,6 +144,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mongo.database", "server_admin")
 	v.SetDefault("mongo.timeoutSeconds", 10)
 
+	v.SetDefault("redis.enabled", false)
+	v.SetDefault("redis.addr", "127.0.0.1:6379")
+	v.SetDefault("redis.password", "")
+	v.SetDefault("redis.db", 0)
+
+	v.SetDefault("cache.publicTTLSeconds", 600)
+	v.SetDefault("cache.userTTLSeconds", 120)
+	v.SetDefault("cache.roleTTLSeconds", 300)
+
 	v.SetDefault("jwt.secret", "server-admin-secret-please-change-me")
 	v.SetDefault("jwt.issuer", "server-admin")
 	v.SetDefault("jwt.accessExpireMinutes", 120)
@@ -158,6 +184,18 @@ func (c *Config) normalize() {
 	}
 	if c.Mongo.TimeoutSeconds <= 0 {
 		c.Mongo.TimeoutSeconds = 10
+	}
+	if c.Redis.Addr == "" {
+		c.Redis.Addr = "127.0.0.1:6379"
+	}
+	if c.Cache.PublicTTLSeconds <= 0 {
+		c.Cache.PublicTTLSeconds = 600
+	}
+	if c.Cache.UserTTLSeconds <= 0 {
+		c.Cache.UserTTLSeconds = 120
+	}
+	if c.Cache.RoleTTLSeconds <= 0 {
+		c.Cache.RoleTTLSeconds = 300
 	}
 	if c.OpLog.BodyMaxBytes <= 0 {
 		c.OpLog.BodyMaxBytes = 2048

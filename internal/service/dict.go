@@ -8,18 +8,20 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
 )
 
 // DictService 字典管理。
 type DictService struct {
-	db *mongo.Database
+	db    *mongo.Database
+	cache *cache.Helper
 }
 
 // NewDictService 创建字典服务。
-func NewDictService(db *mongo.Database) *DictService {
-	return &DictService{db: db}
+func NewDictService(db *mongo.Database, helper *cache.Helper) *DictService {
+	return &DictService{db: db, cache: helper}
 }
 
 // DictTypeInput 字典类型。
@@ -62,6 +64,9 @@ func (s *DictService) TypeCreate(ctx context.Context, in *DictTypeInput) (*model
 	t := &model.DictType{Name: in.Name, Code: in.Code, Status: in.Status, Remark: in.Remark}
 	t.PrepareCreate()
 	_, err := s.db.Collection(model.ColDictType).InsertOne(ctx, t)
+	if err == nil {
+		s.invalidateDict(ctx)
+	}
 	return t, err
 }
 
@@ -90,6 +95,9 @@ func (s *DictService) TypeUpdate(ctx context.Context, id string, in *DictTypeInp
 			bson.M{"typeCode": old.Code},
 			bson.M{"$set": bson.M{"typeCode": in.Code}})
 	}
+	if err == nil {
+		s.invalidateDict(ctx)
+	}
 	return err
 }
 
@@ -116,6 +124,9 @@ func (s *DictService) TypeDelete(ctx context.Context, ids []string) error {
 		return err
 	}
 	_, err = s.db.Collection(model.ColDictType).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err == nil {
+		s.invalidateDict(ctx)
+	}
 	return err
 }
 
@@ -144,6 +155,9 @@ func (s *DictService) ItemCreate(ctx context.Context, in *DictItemInput) (*model
 	}
 	i.PrepareCreate()
 	_, err := s.db.Collection(model.ColDictItem).InsertOne(ctx, i)
+	if err == nil {
+		s.invalidateDict(ctx)
+	}
 	return i, err
 }
 
@@ -158,6 +172,9 @@ func (s *DictService) ItemUpdate(ctx context.Context, id string, in *DictItemInp
 	_, err := s.db.Collection(model.ColDictItem).UpdateOne(ctx, bson.M{"_id": id},
 		bson.M{"$set": bson.M{"label": in.Label, "value": in.Value, "tagType": in.TagType,
 			"sort": in.Sort, "status": in.Status, "remark": in.Remark, "updatedAt": time.Now()}})
+	if err == nil {
+		s.invalidateDict(ctx)
+	}
 	return err
 }
 
@@ -167,21 +184,33 @@ func (s *DictService) ItemDelete(ctx context.Context, ids []string) error {
 		return errs.BadRequest("请选择要删除的字典项")
 	}
 	_, err := s.db.Collection(model.ColDictItem).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err == nil {
+		s.invalidateDict(ctx)
+	}
 	return err
 }
 
 // GetByCode 按字典编码取启用的字典项（供下拉框使用）。
+// PUBLIC 策略：字典数据全用户共享（如国家/货币），Key: serveradmin:v1:dict:{code}。
 func (s *DictService) GetByCode(ctx context.Context, code string) ([]*model.DictItem, error) {
-	opts := options.Find().SetSort(bson.D{{Key: "sort", Value: 1}})
-	cursor, err := s.db.Collection(model.ColDictItem).Find(ctx,
-		bson.M{"typeCode": code, "status": model.StatusEnabled}, opts)
-	if err != nil {
-		return nil, err
-	}
-	defer cursor.Close(ctx)
-	list := make([]*model.DictItem, 0)
-	if err := cursor.All(ctx, &list); err != nil {
-		return nil, err
-	}
-	return list, nil
+	return cache.GetJSON(s.cache, ctx, cache.PublicKey("dict", code), s.cache.TTL.Public,
+		func(ctx context.Context) ([]*model.DictItem, error) {
+			opts := options.Find().SetSort(bson.D{{Key: "sort", Value: 1}})
+			cursor, err := s.db.Collection(model.ColDictItem).Find(ctx,
+				bson.M{"typeCode": code, "status": model.StatusEnabled}, opts)
+			if err != nil {
+				return nil, err
+			}
+			defer cursor.Close(ctx)
+			list := make([]*model.DictItem, 0)
+			if err := cursor.All(ctx, &list); err != nil {
+				return nil, err
+			}
+			return list, nil
+		})
+}
+
+// invalidateDict 写操作成功后失效全部字典缓存变体。
+func (s *DictService) invalidateDict(ctx context.Context) {
+	s.cache.Invalidate(ctx, cache.BizPrefix("dict"))
 }

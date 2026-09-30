@@ -25,6 +25,18 @@ mongo:
   database: "server_admin"
   timeoutSeconds: 10            # 连接与 Ping 超时
 
+redis:
+  enabled: true                 # 是否启用 Redis 缓存（关闭后所有接口直连 MongoDB）
+  addr: "127.0.0.1:6379"        # Redis 地址
+  password: ""                  # 密码，无则留空
+  db: 0                         # 逻辑库编号
+
+cache:
+  # 缓存策略 TTL（秒），按策略区分，不要全部一样：
+  publicTTLSeconds: 600         # PUBLIC 全用户共享（系统参数/字典），变化少，可长
+  userTTLSeconds: 120           # USER 按用户区分（个人资料/工作台），要短
+  roleTTLSeconds: 300           # ROLE 按角色区分（菜单/权限），中等
+
 jwt:
   # 生产环境务必修改，或用环境变量 SA_JWT_SECRET 注入
   secret: "server-admin-secret-please-change-me"

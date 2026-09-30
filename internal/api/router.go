@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/middleware"
 	"serveradmin/internal/pkg/jwtx"
@@ -46,6 +47,7 @@ func NewRouter(cfg *config.Config, reg *service.Registry, jwtMgr *jwtx.Manager, 
 	authed := apiGroup.Group("")
 	authed.Use(middleware.Auth(jwtMgr, reg.Perm, reg.Online, reg.Token))
 	authed.Use(middleware.OpLog(cfg, reg.Log))
+	authed.Use(responseCache(cfg, reg))
 
 	NewAuthAPI(reg.Auth, reg.Online).Register(public, authed)
 	NewConfigAPI(reg.SysConfig).Register(public, authed)
@@ -66,6 +68,27 @@ func NewRouter(cfg *config.Config, reg *service.Registry, jwtMgr *jwtx.Manager, 
 	setupWebUI(r)
 
 	return r
+}
+
+// responseCache 显式 API 缓存配置：路由模式 -> 缓存策略。
+// 只缓存无权限门槛的 GET 接口（组级中间件先于 RequirePerm 执行，
+// PUBLIC 缓存会把数据泄露给无权限用户，故带权限校验的接口一律不缓存）；
+// 未列出的路由视为 NONE，完全不缓存（用户列表/日志/监控等实时数据）。
+func responseCache(cfg *config.Config, reg *service.Registry) gin.HandlerFunc {
+	routes := map[string]cache.Rule{
+		// USER：每个用户不同，serveradmin:v1:user:{uid}:profile
+		"GET /api/v1/auth/profile": {Policy: cache.PolicyUser, Resource: "profile"},
+		// USER：工作台统计，按用户区分，随 userTTL 自动过期
+		"GET /api/v1/dashboard/stats": {Policy: cache.PolicyUser, Resource: "dashboard"},
+	}
+	identity := func(c *gin.Context) (string, []string, bool) {
+		id := middleware.FromContext(c)
+		if id == nil {
+			return "", nil, false
+		}
+		return id.UserID, id.Roles, true
+	}
+	return cache.ResponseCache(reg.Cache, reg.CacheHelper.TTL, routes, identity)
 }
 
 func setupWebUI(r *gin.Engine) {

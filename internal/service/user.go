@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/crypto/bcrypt"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
@@ -20,13 +21,14 @@ const BuiltInAdminUsername = "admin"
 
 // UserService 用户管理。
 type UserService struct {
-	db  *mongo.Database
-	cfg *config.Config
+	db    *mongo.Database
+	cfg   *config.Config
+	cache *cache.Helper
 }
 
 // NewUserService 创建用户服务。
-func NewUserService(db *mongo.Database, cfg *config.Config) *UserService {
-	return &UserService{db: db, cfg: cfg}
+func NewUserService(db *mongo.Database, cfg *config.Config, helper *cache.Helper) *UserService {
+	return &UserService{db: db, cfg: cfg, cache: helper}
 }
 
 var usernameRe = regexp.MustCompile(`^[a-zA-Z0-9_\-@.]{2,32}$`)
@@ -213,6 +215,10 @@ func (s *UserService) Update(ctx context.Context, id string, in *UserInput) erro
 		update["status"] = in.Status
 	}
 	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": update})
+	if err == nil {
+		// 写操作成功后失效该用户的缓存（个人资料/工作台）
+		s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	}
 	return err
 }
 
@@ -235,6 +241,13 @@ func (s *UserService) Delete(ctx context.Context, ids []string, operatorID strin
 		return errs.Forbidden("内置管理员不允许删除")
 	}
 	_, err = s.db.Collection(model.ColUser).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err == nil {
+		prefixes := make([]string, 0, len(ids))
+		for _, id := range ids {
+			prefixes = append(prefixes, cache.UserPrefix(id))
+		}
+		s.cache.Invalidate(ctx, prefixes...)
+	}
 	return err
 }
 
@@ -252,6 +265,9 @@ func (s *UserService) SetStatus(ctx context.Context, id string, status int) erro
 	}
 	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": id},
 		bson.M{"$set": bson.M{"status": status, "updatedAt": time.Now()}})
+	if err == nil {
+		s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	}
 	return err
 }
 
@@ -269,6 +285,9 @@ func (s *UserService) ResetPassword(ctx context.Context, id string, password str
 	}
 	_, err = s.db.Collection(model.ColUser).UpdateOne(ctx, bson.M{"_id": id},
 		bson.M{"$set": bson.M{"password": string(hash), "updatedAt": time.Now()}})
+	if err == nil {
+		s.cache.Invalidate(ctx, cache.UserPrefix(id))
+	}
 	return err
 }
 

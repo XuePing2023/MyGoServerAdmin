@@ -216,7 +216,12 @@ func (a *ConfigAPI) delete(c *gin.Context) {
 
 // GET /api/v1/configs/public 公开信息（登录页用）
 func (a *ConfigAPI) publicInfo(c *gin.Context) {
-	response.OK(c, a.svc.Public(c.Request.Context()))
+	info, err := a.svc.Public(c.Request.Context())
+	if err != nil {
+		response.Handle(c, err)
+		return
+	}
+	response.OK(c, info)
 }
 
 // NoticeAPI 通知公告接口。

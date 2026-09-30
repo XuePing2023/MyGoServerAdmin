@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
 )
@@ -17,13 +18,14 @@ var roleCodeRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{1,31}$`)
 
 // RoleService 角色管理。
 type RoleService struct {
-	db   *mongo.Database
-	perm *PermService
+	db    *mongo.Database
+	perm  *PermService
+	cache *cache.Helper
 }
 
 // NewRoleService 创建角色服务。
-func NewRoleService(db *mongo.Database) *RoleService {
-	return &RoleService{db: db}
+func NewRoleService(db *mongo.Database, helper *cache.Helper) *RoleService {
+	return &RoleService{db: db, cache: helper}
 }
 
 // SetPerm 注入权限缓存。
@@ -137,7 +139,7 @@ func (s *RoleService) Update(ctx context.Context, id string, in *RoleInput) erro
 	if err != nil {
 		return err
 	}
-	s.invalidate()
+	s.invalidate(ctx)
 	return nil
 }
 
@@ -175,7 +177,7 @@ func (s *RoleService) Delete(ctx context.Context, ids []string) error {
 	if err != nil {
 		return err
 	}
-	s.invalidate()
+	s.invalidate(ctx)
 	return nil
 }
 
@@ -192,12 +194,14 @@ func (s *RoleService) AssignMenus(ctx context.Context, id string, menuIDs []stri
 	if err != nil {
 		return err
 	}
-	s.invalidate()
+	s.invalidate(ctx)
 	return nil
 }
 
-func (s *RoleService) invalidate() {
+func (s *RoleService) invalidate(ctx context.Context) {
 	if s.perm != nil {
 		s.perm.InvalidateAll()
 	}
+	// 角色变更影响按角色缓存的菜单树（serveradmin:v1:role:*）
+	s.cache.Invalidate(ctx, cache.RolePrefix())
 }

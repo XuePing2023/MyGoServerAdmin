@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/jwtx"
@@ -32,23 +33,36 @@ type Registry struct {
 	Job       *JobService
 	Dashboard *DashboardService
 	Monitor   *MonitorService
+
+	// Cache 原始缓存实现（供 HTTP 响应缓存中间件使用），未启用 Redis 时为 nil。
+	Cache cache.Cache
+	// CacheHelper 服务层 Cache-Aside 助手（内置 singleflight），始终可用。
+	CacheHelper *cache.Helper
 }
 
-// New 构建所有服务。jwtMgr 由 main 创建后传入。
-func New(db *mongo.Database, cfg *config.Config, jwtMgr *jwtx.Manager) *Registry {
+// New 构建所有服务。jwtMgr 由 main 创建后传入；cacheClient 为 nil 表示未启用缓存。
+func New(db *mongo.Database, cfg *config.Config, jwtMgr *jwtx.Manager, cacheClient cache.Cache) *Registry {
+	helper := cache.NewHelper(cacheClient, cache.TTLConfig{
+		Public: time.Duration(cfg.Cache.PublicTTLSeconds) * time.Second,
+		User:   time.Duration(cfg.Cache.UserTTLSeconds) * time.Second,
+		Role:   time.Duration(cfg.Cache.RoleTTLSeconds) * time.Second,
+	})
 	r := &Registry{
-		Perm:   NewPermService(db),
-		Token:  NewTokenService(db),
-		Online: NewOnlineService(time.Duration(cfg.JWT.AccessExpireMinutes) * time.Minute),
+		Perm:        NewPermService(db),
+		Token:       NewTokenService(db),
+		Online:      NewOnlineService(time.Duration(cfg.JWT.AccessExpireMinutes) * time.Minute),
+		Cache:       cacheClient,
+		CacheHelper: helper,
 	}
-	r.Menu = NewMenuService(db)
+	r.Menu = NewMenuService(db, helper)
 	r.Menu.SetPerm(r.Perm)
-	r.Auth = NewAuthService(db, cfg, jwtMgr, r.Token, r.Menu, r.Perm)
-	r.User = NewUserService(db, cfg)
-	r.Role = NewRoleService(db)
+	r.Auth = NewAuthService(db, cfg, jwtMgr, r.Token, r.Menu, r.Perm, helper)
+	r.User = NewUserService(db, cfg, helper)
+	r.Role = NewRoleService(db, helper)
+	r.Role.SetPerm(r.Perm)
 	r.Dept = NewDepartmentService(db)
-	r.Dict = NewDictService(db)
-	r.SysConfig = NewSysConfigService(db)
+	r.Dict = NewDictService(db, helper)
+	r.SysConfig = NewSysConfigService(db, helper)
 	r.Log = NewLogService(db)
 	r.File = NewFileService(db, cfg)
 	r.Notice = NewNoticeService(db)

@@ -7,18 +7,20 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
 )
 
 // SysConfigService 系统参数管理。
 type SysConfigService struct {
-	db *mongo.Database
+	db    *mongo.Database
+	cache *cache.Helper
 }
 
 // NewSysConfigService 创建系统参数服务。
-func NewSysConfigService(db *mongo.Database) *SysConfigService {
-	return &SysConfigService{db: db}
+func NewSysConfigService(db *mongo.Database, helper *cache.Helper) *SysConfigService {
+	return &SysConfigService{db: db, cache: helper}
 }
 
 // ConfigInput 参数创建/更新。
@@ -53,6 +55,10 @@ func (s *SysConfigService) Create(ctx context.Context, in *ConfigInput) (*model.
 	c := &model.SysConfig{Key: in.Key, Name: in.Name, Value: in.Value, Remark: in.Remark}
 	c.PrepareCreate()
 	_, err := s.db.Collection(model.ColSysConfig).InsertOne(ctx, c)
+	if err == nil {
+		// 写操作成功后失效 PUBLIC 缓存
+		s.cache.Invalidate(ctx, cache.BizPrefix("system"))
+	}
 	return c, err
 }
 
@@ -65,6 +71,9 @@ func (s *SysConfigService) Update(ctx context.Context, id string, in *ConfigInpu
 	if old.BuiltIn {
 		_, err := s.db.Collection(model.ColSysConfig).UpdateOne(ctx, bson.M{"_id": id},
 			bson.M{"$set": bson.M{"value": in.Value, "remark": in.Remark, "updatedAt": time.Now()}})
+		if err == nil {
+			s.cache.Invalidate(ctx, cache.BizPrefix("system"))
+		}
 		return err
 	}
 	if in.Key != old.Key {
@@ -78,6 +87,9 @@ func (s *SysConfigService) Update(ctx context.Context, id string, in *ConfigInpu
 	_, err := s.db.Collection(model.ColSysConfig).UpdateOne(ctx, bson.M{"_id": id},
 		bson.M{"$set": bson.M{"key": in.Key, "name": in.Name, "value": in.Value,
 			"remark": in.Remark, "updatedAt": time.Now()}})
+	if err == nil {
+		s.cache.Invalidate(ctx, cache.BizPrefix("system"))
+	}
 	return err
 }
 
@@ -93,34 +105,42 @@ func (s *SysConfigService) Delete(ctx context.Context, ids []string) error {
 		return errs.Forbidden("内置参数不允许删除")
 	}
 	_, err := s.db.Collection(model.ColSysConfig).DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err == nil {
+		s.cache.Invalidate(ctx, cache.BizPrefix("system"))
+	}
 	return err
 }
 
-// Public 返回登录页需要展示的公开信息。
-func (s *SysConfigService) Public(ctx context.Context) map[string]string {
-	out := map[string]string{"name": "ServerAdmin", "version": "1.0.0", "copyright": ""}
-	cursor, err := s.db.Collection(model.ColSysConfig).Find(ctx,
-		bson.M{"key": bson.M{"$in": []string{"sys.name", "sys.version", "sys.copyright"}}})
-	if err != nil {
-		return out
-	}
-	defer cursor.Close(ctx)
-	var list []*model.SysConfig
-	if cursor.All(ctx, &list) == nil {
-		for _, c := range list {
-			switch c.Key {
-			case "sys.name":
-				if c.Value != "" {
-					out["name"] = c.Value
-				}
-			case "sys.version":
-				if c.Value != "" {
-					out["version"] = c.Value
-				}
-			case "sys.copyright":
-				out["copyright"] = c.Value
+// Public 返回登录页需要展示的公开信息（PUBLIC 策略：所有用户相同，
+// Key: serveradmin:v1:system:config）。
+func (s *SysConfigService) Public(ctx context.Context) (map[string]string, error) {
+	return cache.GetJSON(s.cache, ctx, cache.PublicKey("system", "config"), s.cache.TTL.Public,
+		func(ctx context.Context) (map[string]string, error) {
+			out := map[string]string{"name": "ServerAdmin", "version": "1.0.0", "copyright": ""}
+			cursor, err := s.db.Collection(model.ColSysConfig).Find(ctx,
+				bson.M{"key": bson.M{"$in": []string{"sys.name", "sys.version", "sys.copyright"}}})
+			if err != nil {
+				return nil, err
 			}
-		}
-	}
-	return out
+			defer cursor.Close(ctx)
+			var list []*model.SysConfig
+			if err := cursor.All(ctx, &list); err != nil {
+				return nil, err
+			}
+			for _, c := range list {
+				switch c.Key {
+				case "sys.name":
+					if c.Value != "" {
+						out["name"] = c.Value
+					}
+				case "sys.version":
+					if c.Value != "" {
+						out["version"] = c.Value
+					}
+				case "sys.copyright":
+					out["copyright"] = c.Value
+				}
+			}
+			return out, nil
+		})
 }

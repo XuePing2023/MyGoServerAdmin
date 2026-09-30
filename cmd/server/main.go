@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"serveradmin/internal/api"
+	"serveradmin/internal/cache"
 	"serveradmin/internal/config"
 	"serveradmin/internal/database"
 	"serveradmin/internal/pkg/jwtx"
@@ -64,8 +65,21 @@ func main() {
 		time.Duration(cfg.JWT.AccessExpireMinutes)*time.Minute,
 		time.Duration(cfg.JWT.RefreshExpireHours)*time.Hour)
 
+	// Redis 缓存：enabled=false 或连接失败时降级为无缓存模式（直连 MongoDB）
+	var cacheClient cache.Cache
+	if cfg.Redis.Enabled {
+		rdb, err := cache.Connect(context.Background(), &cfg.Redis)
+		if err != nil {
+			logger.L.Warnf("Redis 连接失败（%s）: %v，缓存已停用", cfg.Redis.Addr, err)
+		} else {
+			cacheClient = cache.NewRedisCache(rdb)
+			defer func() { _ = rdb.Close() }()
+			logger.L.Infof("Redis 已连接: %s (db=%d)", cfg.Redis.Addr, cfg.Redis.DB)
+		}
+	}
+
 	// 服务注册
-	reg := service.New(db, cfg, jwtMgr)
+	reg := service.New(db, cfg, jwtMgr, cacheClient)
 
 	// 令牌黑名单预热 + 定时任务调度器
 	bg := context.Background()

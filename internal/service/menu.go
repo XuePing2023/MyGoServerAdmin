@@ -8,19 +8,21 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"serveradmin/internal/cache"
 	"serveradmin/internal/model"
 	"serveradmin/internal/pkg/errs"
 )
 
 // MenuService 菜单/权限管理。
 type MenuService struct {
-	db   *mongo.Database
-	perm *PermService // 变更后失效权限缓存
+	db    *mongo.Database
+	perm  *PermService // 变更后失效权限缓存
+	cache *cache.Helper
 }
 
 // NewMenuService 创建菜单服务。
-func NewMenuService(db *mongo.Database) *MenuService {
-	return &MenuService{db: db}
+func NewMenuService(db *mongo.Database, helper *cache.Helper) *MenuService {
+	return &MenuService{db: db, cache: helper}
 }
 
 // SetPerm 注入权限缓存服务（避免构建期循环）。
@@ -51,7 +53,16 @@ func (s *MenuService) Tree(ctx context.Context) ([]*model.Menu, error) {
 
 // GetForRoles 根据角色编码返回可见菜单树（目录/页面，不含按钮），
 // 超级管理员返回全部。
+// ROLE 策略：按角色区分，Key: serveradmin:v1:role:{roles}:menu，
+// 菜单/角色变更时整体失效。
 func (s *MenuService) GetForRoles(ctx context.Context, codes []string) ([]*model.Menu, error) {
+	return cache.GetJSON(s.cache, ctx, cache.RoleKey(cache.RoleSegment(codes), "menu"), s.cache.TTL.Role,
+		func(ctx context.Context) ([]*model.Menu, error) {
+			return s.loadForRoles(ctx, codes)
+		})
+}
+
+func (s *MenuService) loadForRoles(ctx context.Context, codes []string) ([]*model.Menu, error) {
 	for _, c := range codes {
 		if c == model.SuperRoleCode {
 			list, err := s.allMenus(ctx, bson.M{"status": model.StatusEnabled})
@@ -150,7 +161,7 @@ func (s *MenuService) Create(ctx context.Context, in *MenuInput) (*model.Menu, e
 	if err != nil {
 		return nil, err
 	}
-	s.invalidate()
+	s.invalidate(ctx)
 	return m, nil
 }
 
@@ -188,7 +199,7 @@ func (s *MenuService) Update(ctx context.Context, id string, in *MenuInput) erro
 	if err != nil {
 		return err
 	}
-	s.invalidate()
+	s.invalidate(ctx)
 	return nil
 }
 
@@ -208,7 +219,7 @@ func (s *MenuService) Delete(ctx context.Context, id string) error {
 	if res.DeletedCount == 0 {
 		return errs.NotFound("菜单不存在")
 	}
-	s.invalidate()
+	s.invalidate(ctx)
 	return nil
 }
 
@@ -248,10 +259,12 @@ func (s *MenuService) descendantIDs(ctx context.Context, roots []string) ([]stri
 	return result, nil
 }
 
-func (s *MenuService) invalidate() {
+func (s *MenuService) invalidate(ctx context.Context) {
 	if s.perm != nil {
 		s.perm.InvalidateAll()
 	}
+	// 菜单变更影响角色菜单树（ROLE）与菜单管理树（PUBLIC）缓存
+	s.cache.Invalidate(ctx, cache.RolePrefix(), cache.BizPrefix("menu"))
 }
 
 // buildMenuTree 组装树（parentID 为根）。
